@@ -1,10 +1,10 @@
 #!/bin/bash
 # claudeline installer
-# Usage: curl -fsSL https://raw.githubusercontent.com/chadfurman/claudeline/main/install.sh | bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/chad-fossa/claudeline/main/install.sh | bash
 
 set -e
 
-REPO="https://raw.githubusercontent.com/chadfurman/claudeline/main"
+REPO="https://raw.githubusercontent.com/chad-fossa/claudeline/main"
 CLAUDE_DIR="$HOME/.claude"
 
 echo "Installing claudeline..."

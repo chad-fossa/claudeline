@@ -21,7 +21,7 @@ Context window. Usage limits with reset times. Git integration.
 ## Quick install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/chadfurman/claudeline/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/chad-fossa/claudeline/main/install.sh | bash
 ```
 
 Restart Claude Code. That's it.
@@ -84,7 +84,7 @@ Usage limits refresh automatically on:
 If you prefer not to pipe to bash:
 
 ```bash
-git clone https://github.com/chadfurman/claudeline.git
+git clone https://github.com/chad-fossa/claudeline.git
 cd claudeline
 
 cp statusline-command.sh ~/.claude/
