@@ -29,15 +29,16 @@ Restart Claude Code. That's it.
 ## What you get
 
 ```
-▕██▎  ▏ 28% 14:32:9% 02/15:3% │ my-project:feature/auth #42 ←↑
+▕██▎  ▏ 28% 3pm:9% 02/15:3% │ my-project:feature/auth #42 ←↑
 ```
 
 | Segment | What it shows |
 |---------|--------------|
 | `▕██▎  ▏ 28%` | Context window usage. Green < 50%, yellow 50-85%, red > 85%. |
-| `14:32:9%` | 5-hour usage at 9%. Resets at 14:32 local time. |
+| `3pm:9%` | 5-hour usage at 9%. Resets at 3pm local time. |
 | `02/15:3%` | 7-day usage at 3%. Resets on Feb 15. |
 | `my-project:feature/auth` | Repo and branch. |
+| `⎇my-project:feature/auth` | Repo and branch inside a git worktree. |
 | `#42` | PR number. Clickable in supported terminals. |
 | `←↑` | Working tree and sync status (see reference below). |
 
@@ -47,7 +48,7 @@ Three components, one cache file.
 
 | File | Role |
 |------|------|
-| `statusline-command.sh` | Renders the statusline every prompt. Reads context from Claude's JSON input, usage from cache. |
+| `statusline-command.sh` | Renders the statusline every prompt. Reads context from Claude's JSON input (uses pre-calculated `used_percentage` when available), usage from cache. |
 | `hooks/show-usage-limits.sh` | Fetches usage from Anthropic's API at session start and after compaction. Writes to `/tmp/.claude_usage_limits.json`. |
 | `skills/usage/SKILL.md` | Adds a `/usage` slash command to refresh on demand. |
 
@@ -71,6 +72,7 @@ Usage limits refresh automatically on:
 | `↑` | Commits to push |
 | `↓` | Commits to pull |
 | `⇅` | Both push and pull |
+| `⎇` | Inside a git worktree |
 
 ## Requirements
 
