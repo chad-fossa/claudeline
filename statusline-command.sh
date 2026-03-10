@@ -53,13 +53,16 @@ get_usage_limits() {
   fi
 
   # Convert reset times from UTC to local display format
-  local label5="5h" label7="7d" epoch
+  # Strip fractional seconds AND timezone suffix for clean parsing
+  local label5="5h" label7="7d" epoch clean_ts
   if [[ -n "$reset5" ]]; then
-    epoch=$(TZ=UTC date -jf "%Y-%m-%dT%H:%M:%S" "${reset5%%.*}" "+%s" 2>/dev/null) \
-      && label5=$(date -r "$epoch" "+%H:%M" 2>/dev/null) || label5="5h"
+    clean_ts="${reset5%%[.+]*}"
+    epoch=$(TZ=UTC date -jf "%Y-%m-%dT%H:%M:%S" "$clean_ts" "+%s" 2>/dev/null) \
+      && label5=$(date -r "$epoch" "+%-I%p" 2>/dev/null | tr '[:upper:]' '[:lower:]') || label5="5h"
   fi
   if [[ -n "$reset7" ]]; then
-    epoch=$(TZ=UTC date -jf "%Y-%m-%dT%H:%M:%S" "${reset7%%.*}" "+%s" 2>/dev/null) \
+    clean_ts="${reset7%%[.+]*}"
+    epoch=$(TZ=UTC date -jf "%Y-%m-%dT%H:%M:%S" "$clean_ts" "+%s" 2>/dev/null) \
       && label7=$(date -r "$epoch" "+%m/%d" 2>/dev/null) || label7="7d"
   fi
 
@@ -83,16 +86,18 @@ get_usage_limits() {
 # Context window
 # ─────────────────────────────────────────────────────────────
 get_context() {
-  local size usage current percent
-  size=$(echo "$INPUT" | jq -r '.context_window.context_window_size // 200000')
-  usage=$(echo "$INPUT" | jq '.context_window.current_usage // null')
-
-  if [[ "$usage" != "null" ]]; then
-    current=$(echo "$usage" | jq -r '(.input_tokens // 0) + (.cache_creation_input_tokens // 0) + (.cache_read_input_tokens // 0)')
-  else
-    current=0
+  # Prefer the pre-calculated used_percentage if available
+  local percent
+  percent=$(echo "$INPUT" | jq -r '.context_window.used_percentage // empty')
+  if [[ -n "$percent" && "$percent" != "null" ]]; then
+    echo "$percent"
+    return
   fi
 
+  # Fallback: calculate manually from token counts
+  local size current
+  size=$(echo "$INPUT" | jq -r '.context_window.context_window_size // 200000')
+  current=$(echo "$INPUT" | jq -r '(.context_window.current_usage // {}) | ((.input_tokens // 0) + (.cache_creation_input_tokens // 0) + (.cache_read_input_tokens // 0))')
   percent=$((size > 0 ? current * 100 / size : 0))
   echo "$percent"
 }
@@ -235,6 +240,19 @@ get_sync_status() {
   fi
 }
 
+is_worktree() {
+  # Returns 0 (true) if CWD is inside a git worktree (not the main working tree)
+  local git_dir common_dir
+  git_dir=$(git -C "$CWD" rev-parse --git-dir 2>/dev/null) || return 1
+  common_dir=$(git -C "$CWD" rev-parse --git-common-dir 2>/dev/null) || return 1
+
+  # Resolve to absolute paths for comparison
+  git_dir=$(cd "$CWD" && cd "$git_dir" 2>/dev/null && pwd)
+  common_dir=$(cd "$CWD" && cd "$common_dir" 2>/dev/null && pwd)
+
+  [[ "$git_dir" != "$common_dir" ]]
+}
+
 truncate() {
   local str=$1 max=$2
   if ((${#str} > max)); then
@@ -277,7 +295,12 @@ build_output() {
     local usage_str
     usage_str=$(get_usage_limits)
     [[ -n "$usage_str" ]] && printf '%s ' "$usage_str"
-    printf '%s%s%s:%s%s%s' "$CYAN" "$repo" "$RESET" "$MAGENTA" "$(truncate "$branch" 40)" "$RESET"
+    if is_worktree; then
+      printf '%s⎇%s%s%s:%s%s%s' "$DIM" "$RESET" "$CYAN" "$repo" "$RESET" "$MAGENTA" "$(truncate "$branch" 40)"
+    else
+      printf '%s%s%s:%s%s' "$CYAN" "$repo" "$RESET" "$MAGENTA" "$(truncate "$branch" 40)"
+    fi
+    printf '%s' "$RESET"
     [[ -n "$pr" ]] && printf ' %s%s%s' "$MAGENTA_BRIGHT" "$pr_link" "$RESET"
     [[ -n "$work_status$sync_status" ]] && printf ' %s%s' "$work_status" "$sync_status"
 
