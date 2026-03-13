@@ -63,6 +63,8 @@ Usage limits refresh automatically on:
 - **Context compaction** via the compact matcher
 - **`/usage` command** for manual refresh anytime
 
+All refreshes apply to the active account — if you're in a personal session, `/usage` updates the personal cache; work session updates the work cache.
+
 ## Multiple accounts
 
 claudeline supports running separate work and personal Claude Code accounts on the same machine. Each gets its own auth credentials and usage cache while sharing config.
