@@ -3,7 +3,13 @@
 # Fetches and caches 5-hour and 7-day usage limits at session start and after context compaction
 # The statusline script reads from this cache
 
-readonly CACHE_FILE="/tmp/.claude_usage_limits.json"
+# Per-account cache — detect from CLAUDE_CONFIG_DIR or default to "work"
+if [[ "${CLAUDE_CONFIG_DIR:-}" == *"claude-personal"* ]]; then
+  _ACCT_ID="personal"
+else
+  _ACCT_ID="work"
+fi
+readonly CACHE_FILE="/tmp/.claude_usage_limits_${_ACCT_ID}.json"
 
 # Colors (for the one-time display)
 readonly RESET=$'\033[0m'
@@ -13,13 +19,28 @@ readonly YELLOW=$'\033[33m'
 readonly RED=$'\033[31m'
 
 # Get OAuth token from macOS Keychain
+# NOTE: jq can't parse the full credentials because MCP OAuth tokens
+# (Notion, etc.) have bloated the JSON beyond keychain's output limit,
+# causing truncation. Use grep to extract the token from the beginning.
 get_token() {
+  # Use the right keychain entry per account
+  # Default config dir → "Claude Code-credentials"
+  # Custom config dir → "Claude Code-credentials-{hash}"
+  local keychain_service="Claude Code-credentials"
+  if [[ "$_ACCT_ID" == "personal" ]]; then
+    # Find the non-default keychain entry (has a hash suffix)
+    local alt_service
+    alt_service=$(security dump-keychain 2>/dev/null \
+      | grep -o '"Claude Code-credentials-[^"]*"' \
+      | tr -d '"' | head -1)
+    [[ -n "$alt_service" ]] && keychain_service="$alt_service"
+  fi
   local creds
-  creds=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null)
+  creds=$(security find-generic-password -s "$keychain_service" -w 2>/dev/null)
   if [[ -z "$creds" ]]; then
     return 1
   fi
-  echo "$creds" | jq -r '.claudeAiOauth.accessToken // empty'
+  echo "$creds" | grep -o '"accessToken":"[^"]*"' | head -1 | sed 's/"accessToken":"//;s/"$//'
 }
 
 # Fetch usage limits from API
@@ -101,15 +122,18 @@ main() {
   reset7=$(echo "$usage" | jq -r '.seven_day.resets_at // empty')
 
   # Convert reset times from UTC to local display format
+  # Strip fractional seconds AND timezone suffix to get clean datetime for parsing
   label5="5hr"
   label7="7d"
-  local epoch
+  local epoch clean_ts
   if [[ -n "$reset5" ]]; then
-    epoch=$(TZ=UTC date -jf "%Y-%m-%dT%H:%M:%S" "${reset5%%.*}" "+%s" 2>/dev/null) \
-      && label5=$(date -r "$epoch" "+%H:%M" 2>/dev/null) || label5="5hr"
+    clean_ts="${reset5%%[.+]*}"  # Strip .fractional and +00:00
+    epoch=$(TZ=UTC date -jf "%Y-%m-%dT%H:%M:%S" "$clean_ts" "+%s" 2>/dev/null) \
+      && label5=$(date -r "$epoch" "+%-I%p" 2>/dev/null | tr '[:upper:]' '[:lower:]') || label5="5hr"
   fi
   if [[ -n "$reset7" ]]; then
-    epoch=$(TZ=UTC date -jf "%Y-%m-%dT%H:%M:%S" "${reset7%%.*}" "+%s" 2>/dev/null) \
+    clean_ts="${reset7%%[.+]*}"
+    epoch=$(TZ=UTC date -jf "%Y-%m-%dT%H:%M:%S" "$clean_ts" "+%s" 2>/dev/null) \
       && label7=$(date -r "$epoch" "+%m/%d" 2>/dev/null) || label7="7d"
   fi
 

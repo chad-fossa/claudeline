@@ -24,6 +24,26 @@ INPUT=$(cat)
 CWD=$(echo "$INPUT" | jq -r '.workspace.current_dir // .workspace.project_dir // .cwd // empty')
 [[ -z "$CWD" || ! -d "$CWD" ]] && CWD="$(pwd)"
 
+# ─────────────────────────────────────────────────────────────
+# Account detection (work vs personal via config dir)
+# Customize labels via env vars in .zshrc:
+#   CLAUDE_ACCOUNT_WORK_LABEL="W"        (default: "W")
+#   CLAUDE_ACCOUNT_PERSONAL_LABEL="P"    (default: "P")
+#   CLAUDE_ACCOUNT_WORK_COLOR="\033[36m" (default: cyan)
+#   CLAUDE_ACCOUNT_PERSONAL_COLOR="\033[35m" (default: magenta)
+# ─────────────────────────────────────────────────────────────
+# Detect from CLAUDE_CONFIG_DIR env var (set by shell alias), not transcript_path
+# (transcript_path follows symlinks, so personal→work projects resolve to /.claude/)
+if [[ "${CLAUDE_CONFIG_DIR:-}" == *"claude-personal"* ]]; then
+  ACCOUNT_ID="personal"
+  ACCOUNT_LABEL="${CLAUDE_ACCOUNT_PERSONAL_LABEL:-P}"
+  ACCOUNT_COLOR="${CLAUDE_ACCOUNT_PERSONAL_COLOR:-$MAGENTA}"
+else
+  ACCOUNT_ID="work"
+  ACCOUNT_LABEL="${CLAUDE_ACCOUNT_WORK_LABEL:-W}"
+  ACCOUNT_COLOR="${CLAUDE_ACCOUNT_WORK_COLOR:-$CYAN}"
+fi
+
 # Try to get terminal width from shell-written cache, fall back to 80
 if [[ -f /tmp/.terminal_cols ]]; then
   COLS=$(cat /tmp/.terminal_cols 2>/dev/null)
@@ -35,7 +55,7 @@ fi
 # ─────────────────────────────────────────────────────────────
 # Usage limits (read from cache populated by SessionStart hook)
 # ─────────────────────────────────────────────────────────────
-readonly USAGE_CACHE="/tmp/.claude_usage_limits.json"
+readonly USAGE_CACHE="/tmp/.claude_usage_limits_${ACCOUNT_ID}.json"
 
 get_usage_limits() {
   if [[ ! -f "$USAGE_CACHE" ]]; then
@@ -194,15 +214,30 @@ get_pr_number() {
     local cached_branch cache_age
     cached_branch=$(cat "$branch_cache" 2>/dev/null)
     cache_age=$(($(date +%s) - $(stat -f%m "$cache" 2>/dev/null || echo 0)))
-    if [[ "$cached_branch" == "$branch" && $cache_age -lt 120 ]]; then
+    if [[ "$cached_branch" == "$branch" && $cache_age -lt 600 ]]; then
       cat "$cache"
       return
     fi
   fi
 
-  # Fetch PR
+  # Fetch PR — skip if another fetch is already in flight
+  local lock="/tmp/.claude_pr_lock_${repo_name}"
+  # Expire stale locks older than 10 seconds (crash guard)
+  if [[ -f "$lock" ]]; then
+    local lock_age
+    lock_age=$(($(date +%s) - $(stat -f%m "$lock" 2>/dev/null || echo 0)))
+    if (( lock_age < 10 )); then
+      # Another fetch is in flight — return stale cache rather than pile on
+      [[ -f "$cache" ]] && cat "$cache"
+      return
+    fi
+    rm -f "$lock"
+  fi
+
+  touch "$lock"
   local pr_num
   pr_num=$(timeout 2 gh pr view --json number -q '.number' 2>/dev/null || true)
+  rm -f "$lock"
   if [[ -n "$pr_num" ]]; then
     echo "#$pr_num" > "$cache"
     echo "#$pr_num"
@@ -269,7 +304,11 @@ build_output() {
   local percent repo branch pr pr_num repo_url pr_link work_status sync_status
   percent=$(get_context)
 
-  # Responsive behavior disabled - always show full format
+  # Show account label if multiple accounts exist
+  local acct_prefix=""
+  if [[ -n "$ACCOUNT_LABEL" && -d "$HOME/.claude-personal" && -d "$HOME/.claude" ]]; then
+    acct_prefix=$(printf '%s[%s]%s ' "$ACCOUNT_COLOR" "$ACCOUNT_LABEL" "$RESET")
+  fi
 
   if is_git_repo; then
     repo=$(get_repo_name)
@@ -290,8 +329,8 @@ build_output() {
       fi
     fi
 
-    # Full: bar% usage | repo:branch #PR ↔↑
-    printf '%s %d%% ' "$(progress_bar "$percent")" "$percent"
+    # Full: [W] bar% usage | repo:branch #PR ↔↑
+    printf '%s%s %d%% ' "$acct_prefix" "$(progress_bar "$percent")" "$percent"
     local usage_str
     usage_str=$(get_usage_limits)
     [[ -n "$usage_str" ]] && printf '%s ' "$usage_str"
@@ -309,7 +348,7 @@ build_output() {
     local folder
     folder=$(basename "$CWD")
 
-    printf '%s %d%% ' "$(progress_bar "$percent")" "$percent"
+    printf '%s%s %d%% ' "$acct_prefix" "$(progress_bar "$percent")" "$percent"
     local usage_str
     usage_str=$(get_usage_limits)
     [[ -n "$usage_str" ]] && printf '%s ' "$usage_str"
@@ -320,8 +359,5 @@ build_output() {
 # ─────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────
-# Debug: capture full JSON input (disable after testing)
-echo "$INPUT" | jq '.' > /tmp/statusline-input.json 2>/dev/null
-
 build_output
 exit 0

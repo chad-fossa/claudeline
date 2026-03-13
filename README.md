@@ -7,7 +7,7 @@
 ```
 
 **A rich statusline for Claude Code.**
-Context window. Usage limits with reset times. Git integration.
+Context window. Usage limits with reset times. Git integration. Multi-account support.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![macOS](https://img.shields.io/badge/platform-macOS-lightgrey.svg)]()
@@ -29,11 +29,12 @@ Restart Claude Code. That's it.
 ## What you get
 
 ```
-▕██▎  ▏ 28% 3pm:9% 02/15:3% │ my-project:feature/auth #42 ←↑
+[W] ▕██▎  ▏ 28% 3pm:9% 02/15:3% │ my-project:feature/auth #42 ←↑
 ```
 
 | Segment | What it shows |
 |---------|--------------|
+| `[W]` | Account indicator. Only shown when multiple accounts exist. |
 | `▕██▎  ▏ 28%` | Context window usage. Green < 50%, yellow 50-85%, red > 85%. |
 | `3pm:9%` | 5-hour usage at 9%. Resets at 3pm local time. |
 | `02/15:3%` | 7-day usage at 3%. Resets on Feb 15. |
@@ -44,12 +45,12 @@ Restart Claude Code. That's it.
 
 ## How it works
 
-Three components, one cache file.
+Three components, one cache file per account.
 
 | File | Role |
 |------|------|
 | `statusline-command.sh` | Renders the statusline every prompt. Reads context from Claude's JSON input (uses pre-calculated `used_percentage` when available), usage from cache. |
-| `hooks/show-usage-limits.sh` | Fetches usage from Anthropic's API at session start and after compaction. Writes to `/tmp/.claude_usage_limits.json`. |
+| `hooks/show-usage-limits.sh` | Fetches usage from Anthropic's API at session start and after compaction. Writes to `/tmp/.claude_usage_limits_<account>.json`. |
 | `skills/usage/SKILL.md` | Adds a `/usage` slash command to refresh on demand. |
 
 Usage is fetched only when it matters -- not on every render. The hook writes, the statusline reads.
@@ -61,6 +62,62 @@ Usage limits refresh automatically on:
 - **Session start** via SessionStart hook
 - **Context compaction** via the compact matcher
 - **`/usage` command** for manual refresh anytime
+
+## Multiple accounts
+
+claudeline supports running separate work and personal Claude Code accounts on the same machine. Each gets its own auth credentials and usage cache while sharing config.
+
+### Setup
+
+1. Add aliases to your `.zshrc`:
+
+```bash
+alias claude-work="CLAUDE_CONFIG_DIR=$HOME/.claude claude"
+alias claude-personal="CLAUDE_CONFIG_DIR=$HOME/.claude-personal claude"
+```
+
+2. Run `claude-personal` and authenticate with your personal account.
+
+3. Symlink shared config from work to personal:
+
+```bash
+shared=(CLAUDE.md settings.json skills statusline-command.sh hooks plugins
+        agents commands scripts projects history-index.sqlite statusline-ink
+        plans statsig)
+
+for item in "${shared[@]}"; do
+  rm -rf ~/.claude-personal/"$item"
+  ln -sf ~/.claude/"$item" ~/.claude-personal/"$item"
+done
+```
+
+### How it works
+
+- Credentials are stored in the macOS Keychain with per-config-dir entries
+- The statusline shows `[W]` or `[P]` when both `~/.claude` and `~/.claude-personal` exist
+- Usage limits are cached per-account so they don't clobber each other
+- `claude` (no alias) uses `~/.claude` by default — your work account
+
+### Customizing account labels
+
+Set env vars in `.zshrc`:
+
+```bash
+export CLAUDE_ACCOUNT_WORK_LABEL="W"           # default: "W"
+export CLAUDE_ACCOUNT_PERSONAL_LABEL="P"        # default: "P"
+export CLAUDE_ACCOUNT_WORK_COLOR=$'\033[36m'    # cyan (default)
+export CLAUDE_ACCOUNT_PERSONAL_COLOR=$'\033[35m' # magenta (default)
+```
+
+### What's shared vs separate
+
+| Shared | Per-Account |
+|--------|-------------|
+| CLAUDE.md, settings.json | Auth credentials (Keychain) |
+| Skills, plugins, hooks | settings.local.json |
+| Statusline config | Usage limit cache |
+| Conversation history | Session env/cache |
+| Project memory | |
 
 ## Symbol reference
 
