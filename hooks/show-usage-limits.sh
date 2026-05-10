@@ -23,24 +23,19 @@ readonly RED=$'\033[31m'
 # (Notion, etc.) have bloated the JSON beyond keychain's output limit,
 # causing truncation. Use grep to extract the token from the beginning.
 get_token() {
-  # Use the right keychain entry per account
-  # Default config dir → "Claude Code-credentials"
-  # Custom config dir → "Claude Code-credentials-{hash}"
-  local keychain_service="Claude Code-credentials"
-  if [[ "$_ACCT_ID" == "personal" ]]; then
-    # Find the non-default keychain entry (has a hash suffix)
-    local alt_service
-    alt_service=$(security dump-keychain 2>/dev/null \
-      | grep -o '"Claude Code-credentials-[^"]*"' \
-      | tr -d '"' | head -1)
-    [[ -n "$alt_service" ]] && keychain_service="$alt_service"
-  fi
+  # The Claude Max OAuth token lives in "Claude Code-credentials" regardless of
+  # CLAUDE_CONFIG_DIR — macOS keychain isn't isolated per config dir, last /login wins.
+  # Hashed entries like "Claude Code-credentials-{hash}" exist but hold only mcpOAuth
+  # tokens (with empty accessToken fields), not the Max claudeAiOauth we need.
   local creds
-  creds=$(security find-generic-password -s "$keychain_service" -w 2>/dev/null)
+  creds=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null)
   if [[ -z "$creds" ]]; then
     return 1
   fi
-  echo "$creds" | grep -o '"accessToken":"[^"]*"' | head -1 | sed 's/"accessToken":"//;s/"$//'
+  # Anchor on claudeAiOauth so we don't pick up an empty MCP accessToken.
+  echo "$creds" | grep -o '"claudeAiOauth":{"accessToken":"[^"]*"' \
+    | head -1 \
+    | sed 's/"claudeAiOauth":{"accessToken":"//;s/"$//'
 }
 
 # Fetch usage limits from API
