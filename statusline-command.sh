@@ -18,6 +18,19 @@ readonly MAGENTA=$'\033[35m'
 readonly MAGENTA_BRIGHT=$'\033[95m'
 
 # ─────────────────────────────────────────────────────────────
+# Cross-platform helpers (BSD on macOS, GNU on Linux)
+# ─────────────────────────────────────────────────────────────
+if [[ "$OSTYPE" == "darwin"* ]]; then
+  parse_iso_utc() { TZ=UTC date -jf "%Y-%m-%dT%H:%M:%S" "$1" "+%s" 2>/dev/null; }
+  fmt_epoch()     { date -r "$1" "$2" 2>/dev/null; }
+  file_mtime()    { stat -f%m "$1" 2>/dev/null; }
+else
+  parse_iso_utc() { date -u -d "$1" "+%s" 2>/dev/null; }
+  fmt_epoch()     { date -d "@$1" "$2" 2>/dev/null; }
+  file_mtime()    { stat -c%Y "$1" 2>/dev/null; }
+fi
+
+# ─────────────────────────────────────────────────────────────
 # Input parsing
 # ─────────────────────────────────────────────────────────────
 INPUT=$(cat)
@@ -77,13 +90,13 @@ get_usage_limits() {
   local label5="5h" label7="7d" epoch clean_ts
   if [[ -n "$reset5" ]]; then
     clean_ts="${reset5%%[.+]*}"
-    epoch=$(TZ=UTC date -jf "%Y-%m-%dT%H:%M:%S" "$clean_ts" "+%s" 2>/dev/null) \
-      && label5=$(date -r "$epoch" "+%-I%p" 2>/dev/null | tr '[:upper:]' '[:lower:]') || label5="5h"
+    epoch=$(parse_iso_utc "$clean_ts") \
+      && label5=$(fmt_epoch "$epoch" "+%-I%p" | tr '[:upper:]' '[:lower:]') || label5="5h"
   fi
   if [[ -n "$reset7" ]]; then
     clean_ts="${reset7%%[.+]*}"
-    epoch=$(TZ=UTC date -jf "%Y-%m-%dT%H:%M:%S" "$clean_ts" "+%s" 2>/dev/null) \
-      && label7=$(date -r "$epoch" "+%m/%d" 2>/dev/null) || label7="7d"
+    epoch=$(parse_iso_utc "$clean_ts") \
+      && label7=$(fmt_epoch "$epoch" "+%m/%d") || label7="7d"
   fi
 
   # Utilization values are already percentages (e.g., 15.0 = 15%)
@@ -213,7 +226,7 @@ get_pr_number() {
   if [[ -f "$cache" && -f "$branch_cache" ]]; then
     local cached_branch cache_age
     cached_branch=$(cat "$branch_cache" 2>/dev/null)
-    cache_age=$(($(date +%s) - $(stat -f%m "$cache" 2>/dev/null || echo 0)))
+    cache_age=$(($(date +%s) - $(file_mtime "$cache" || echo 0)))
     if [[ "$cached_branch" == "$branch" && $cache_age -lt 600 ]]; then
       cat "$cache"
       return
@@ -225,7 +238,7 @@ get_pr_number() {
   # Expire stale locks older than 10 seconds (crash guard)
   if [[ -f "$lock" ]]; then
     local lock_age
-    lock_age=$(($(date +%s) - $(stat -f%m "$lock" 2>/dev/null || echo 0)))
+    lock_age=$(($(date +%s) - $(file_mtime "$lock" || echo 0)))
     if (( lock_age < 10 )); then
       # Another fetch is in flight — return stale cache rather than pile on
       [[ -f "$cache" ]] && cat "$cache"
