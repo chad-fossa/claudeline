@@ -10,7 +10,7 @@
 Context window. Usage limits with reset times. Git integration. Multi-account support.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![macOS](https://img.shields.io/badge/platform-macOS-lightgrey.svg)]()
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)]()
 [![Claude Code](https://img.shields.io/badge/Claude_Code-compatible-blueviolet.svg)]()
 
 <!-- TODO: Replace with actual screenshot -->
@@ -95,7 +95,7 @@ done
 
 ### How it works
 
-- Credentials are stored in the macOS Keychain with per-config-dir entries
+- Credentials are stored per-account (macOS Keychain entries on Darwin, `$CLAUDE_CONFIG_DIR/.credentials.json` on Linux)
 - The statusline shows `[W]` or `[P]` when both `~/.claude` and `~/.claude-personal` exist
 - Usage limits are cached per-account so they don't clobber each other
 - `claude` (no alias) uses `~/.claude` by default — your work account
@@ -135,7 +135,9 @@ export CLAUDE_ACCOUNT_PERSONAL_COLOR=$'\033[35m' # magenta (default)
 
 ## Requirements
 
-- **macOS** (uses Keychain for OAuth token retrieval)
+- **macOS or Linux**
+  - macOS reads the OAuth token from Keychain (`Claude Code-credentials`)
+  - Linux reads it from `~/.claude/.credentials.json` (or `$CLAUDE_CONFIG_DIR/.credentials.json`)
 - **Claude Code** with OAuth login
 - **jq**
 - **gh** (optional, for PR detection)

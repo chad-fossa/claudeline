@@ -17,10 +17,13 @@ for cmd in jq curl; do
   fi
 done
 
-if [[ "$(uname)" != "Darwin" ]]; then
-  echo "Error: claudeline requires macOS (uses Keychain for OAuth tokens)." >&2
-  exit 1
-fi
+case "$(uname)" in
+  Darwin|Linux) ;;
+  *)
+    echo "Error: claudeline supports macOS and Linux only (got $(uname))." >&2
+    exit 1
+    ;;
+esac
 
 # Create directories
 mkdir -p "$CLAUDE_DIR/hooks"

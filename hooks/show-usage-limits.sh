@@ -6,8 +6,10 @@
 # Per-account cache — detect from CLAUDE_CONFIG_DIR or default to "work"
 if [[ "${CLAUDE_CONFIG_DIR:-}" == *"claude-personal"* ]]; then
   _ACCT_ID="personal"
+  _CREDS_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude-personal}"
 else
   _ACCT_ID="work"
+  _CREDS_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 fi
 readonly CACHE_FILE="/tmp/.claude_usage_limits_${_ACCT_ID}.json"
 
@@ -18,24 +20,34 @@ readonly GREEN=$'\033[32m'
 readonly YELLOW=$'\033[33m'
 readonly RED=$'\033[31m'
 
-# Get OAuth token from macOS Keychain
-# NOTE: jq can't parse the full credentials because MCP OAuth tokens
-# (Notion, etc.) have bloated the JSON beyond keychain's output limit,
-# causing truncation. Use grep to extract the token from the beginning.
+# Cross-platform date helpers
+if [[ "$OSTYPE" == "darwin"* ]]; then
+  parse_iso_utc() { TZ=UTC date -jf "%Y-%m-%dT%H:%M:%S" "$1" "+%s" 2>/dev/null; }
+  fmt_epoch()     { date -r "$1" "$2" 2>/dev/null; }
+else
+  parse_iso_utc() { date -u -d "$1" "+%s" 2>/dev/null; }
+  fmt_epoch()     { date -d "@$1" "$2" 2>/dev/null; }
+fi
+
+# Get OAuth token: macOS Keychain on Darwin, ~/.claude/.credentials.json on Linux.
 get_token() {
-  # The Claude Max OAuth token lives in "Claude Code-credentials" regardless of
-  # CLAUDE_CONFIG_DIR — macOS keychain isn't isolated per config dir, last /login wins.
-  # Hashed entries like "Claude Code-credentials-{hash}" exist but hold only mcpOAuth
-  # tokens (with empty accessToken fields), not the Max claudeAiOauth we need.
   local creds
-  creds=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null)
-  if [[ -z "$creds" ]]; then
-    return 1
+  if [[ "$OSTYPE" == "darwin"* ]]; then
+    # The Claude Max OAuth token lives in "Claude Code-credentials" regardless of
+    # CLAUDE_CONFIG_DIR — keychain isn't isolated per config dir, last /login wins.
+    # Hashed entries (Claude Code-credentials-{hash}) only hold MCP tokens with
+    # empty accessToken fields, not the Max claudeAiOauth we need.
+    # jq can fail on MCP-bloated entries truncated at keychain's output limit, so use grep.
+    creds=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null) || return 1
+    echo "$creds" | grep -o '"claudeAiOauth":{"accessToken":"[^"]*"' \
+      | head -1 \
+      | sed 's/"claudeAiOauth":{"accessToken":"//;s/"$//'
+  else
+    # Linux: Claude Code persists OAuth to a file under the config dir.
+    local creds_file="${_CREDS_DIR}/.credentials.json"
+    [[ -f "$creds_file" ]] || return 1
+    jq -r '.claudeAiOauth.accessToken // empty' "$creds_file" 2>/dev/null
   fi
-  # Anchor on claudeAiOauth so we don't pick up an empty MCP accessToken.
-  echo "$creds" | grep -o '"claudeAiOauth":{"accessToken":"[^"]*"' \
-    | head -1 \
-    | sed 's/"claudeAiOauth":{"accessToken":"//;s/"$//'
 }
 
 # Fetch usage limits from API
@@ -123,13 +135,13 @@ main() {
   local epoch clean_ts
   if [[ -n "$reset5" ]]; then
     clean_ts="${reset5%%[.+]*}"  # Strip .fractional and +00:00
-    epoch=$(TZ=UTC date -jf "%Y-%m-%dT%H:%M:%S" "$clean_ts" "+%s" 2>/dev/null) \
-      && label5=$(date -r "$epoch" "+%-I%p" 2>/dev/null | tr '[:upper:]' '[:lower:]') || label5="5hr"
+    epoch=$(parse_iso_utc "$clean_ts") \
+      && label5=$(fmt_epoch "$epoch" "+%-I%p" | tr '[:upper:]' '[:lower:]') || label5="5hr"
   fi
   if [[ -n "$reset7" ]]; then
     clean_ts="${reset7%%[.+]*}"
-    epoch=$(TZ=UTC date -jf "%Y-%m-%dT%H:%M:%S" "$clean_ts" "+%s" 2>/dev/null) \
-      && label7=$(date -r "$epoch" "+%m/%d" 2>/dev/null) || label7="7d"
+    epoch=$(parse_iso_utc "$clean_ts") \
+      && label7=$(fmt_epoch "$epoch" "+%m/%d") || label7="7d"
   fi
 
   # Brief one-line display
