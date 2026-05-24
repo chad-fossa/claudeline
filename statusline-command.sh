@@ -67,8 +67,35 @@ fi
 
 # ─────────────────────────────────────────────────────────────
 # Usage limits (read from cache populated by SessionStart hook)
+# Cache is also kept warm by background refresh below — the
+# SessionStart hook seeds it, and statusline renders refresh it
+# when it exceeds USAGE_CACHE_TTL_SECONDS.
 # ─────────────────────────────────────────────────────────────
 readonly USAGE_CACHE="/tmp/.claude_usage_limits_${ACCOUNT_ID}.json"
+readonly USAGE_CACHE_TTL_SECONDS=300
+readonly USAGE_REFRESH_HOOK="$HOME/.claude/hooks/show-usage-limits.sh"
+
+# Spawn a background refresh of the usage cache when it's stale.
+# Render uses whatever cache is currently on disk (no API latency); the
+# refreshed data appears on the *next* statusline render. A short-lived
+# lock prevents stampede when multiple renders fire close together.
+maybe_refresh_usage_cache() {
+  [[ ! -x "$USAGE_REFRESH_HOOK" ]] && return
+
+  local now cache_mtime
+  now=$(date +%s)
+  cache_mtime=$(file_mtime "$USAGE_CACHE" || echo 0)
+  (( now - cache_mtime <= USAGE_CACHE_TTL_SECONDS )) && return
+
+  local lock="/tmp/.claude_usage_refresh_lock_${ACCOUNT_ID}"
+  if [[ -f "$lock" ]]; then
+    local lock_age=$((now - $(file_mtime "$lock" || echo 0)))
+    (( lock_age < 30 )) && return
+    rm -f "$lock"
+  fi
+  touch "$lock"
+  ( "$USAGE_REFRESH_HOOK" </dev/null >/dev/null 2>&1; rm -f "$lock" ) &
+}
 
 get_usage_limits() {
   if [[ ! -f "$USAGE_CACHE" ]]; then
@@ -372,5 +399,6 @@ build_output() {
 # ─────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────
+maybe_refresh_usage_cache
 build_output
 exit 0

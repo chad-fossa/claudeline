@@ -3,11 +3,12 @@
 All notable changes to this project follow [Semantic Versioning](https://semver.org).
 Each release corresponds to a `vMAJOR.MINOR.PATCH` git tag.
 
-## v0.4.0 (2026-05-17)
+## v0.4.0 (2026-05-24)
 
 ### Features
 - **Linux support**: Statusline and hook now run on Linux (tested on Debian 13 / aarch64). Cross-platform `date` helpers (`parse_iso_utc` / `fmt_epoch`) abstract BSD vs GNU `date` flags, and the hook reads OAuth from `$CLAUDE_CONFIG_DIR/.credentials.json` on Linux instead of Keychain. Multi-account selection continues to work — each `CLAUDE_CONFIG_DIR` has its own credentials file.
 - **Installer cross-platform**: `install.sh` now accepts both `Darwin` and `Linux` from `uname` instead of erroring out on non-macOS.
+- **Background usage-cache refresh**: Statusline renders now spawn a background refresh of the usage-limits cache when it's older than 5 minutes, so stats stay current without waiting for the next `SessionStart`. A short-lived lock (`/tmp/.claude_usage_refresh_lock_<account>`) prevents stampede when multiple renders fire close together; the current render always uses on-disk data (zero latency cost), and the refreshed numbers appear on the next render.
 
 ### Fixes
 - Replace `stat -f%m` with a `file_mtime` helper that uses `stat -c%Y` on Linux. Previously the PR/branch and lock-age caches always reported zero age on Linux, defeating the 10-minute cache.
