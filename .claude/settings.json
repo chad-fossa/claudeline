@@ -1,0 +1,4 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "_comment": "Template settings.json deposited by change-factory init. As of v0.17.0 change-factory installs no ROUTING hooks — routing knowledge lives in the /change-factory:change-factory orientation skill (the main thread loads it and decides what to dispatch). The v0.62.0 Step-9 gate ENFORCEMENT hook is wired per-user in .claude/settings.local.json (never this file). This file is intentionally near-empty; add your own repo settings freely. In local mode this lands at .claude/local/settings.json (gitignored); in shared mode at .claude/settings.json (committed)."
+}

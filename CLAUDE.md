@@ -65,3 +65,23 @@ The cache file is what the statusline reads — if it doesn't exist or is stale,
 
 - macOS Keychain stores only one Claude Max OAuth token (`Claude Code-credentials`); `/login` on a second account overwrites the first. Tracked at [anthropics/claude-code#20553](https://github.com/anthropics/claude-code/issues/20553). Work around by re-`/login`-ing on switch.
 - `ANTHROPIC_API_KEY` and `CLAUDE_CODE_OAUTH_TOKEN` env vars override OAuth and force inference-only mode. The hook will still read the keychain, but the active session itself loses Remote Control. Don't export either globally.
+
+## Experts
+
+- consult-expert: claudeline-distribution — install.sh, settings-example.json, README.md, CHANGELOG.md, CLAUDE.md, LICENSE: fresh-install layout and release/versioning discipline.
+- consult-expert: claudeline-core — statusline-command.sh, hooks/, skills/usage/: statusline render+refresh cycle, cache contract, account detection, OAuth acquisition.
+  `<!-- cf:orientation -->` marker onward) to the consuming repo's ROOT CLAUDE.md in SHARED
+  mode only. It intentionally makes NO mention of change-factory — the committed experts load
+  as ordinary Claude Code subagents, so the orientation must read correctly for any teammate
+  whether or not they have the plugin installed. The `<!-- cf:orientation -->` marker is the
+  stable anchor the Doctor heal uses to locate + update this section on a future upgrade.
+  In LOCAL mode nothing is appended — the repo stays untouched.
+-->
+
+<!-- cf:orientation -->
+## Domain experts
+
+This repo ships domain experts in `.claude/agents/` — specialist subagents, each owning a
+specific area of the codebase. They load as ordinary Claude Code subagents. Consult the
+relevant expert when you work in its area.
+

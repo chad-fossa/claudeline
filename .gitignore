@@ -1,0 +1,9 @@
+# change-factory (shared mode) — per-user/session state stays untracked
+.claude/settings.local.json
+.claude/local/
+.claude/sessions/
+.claude/cache/
+.claude/tmp/
+.claude/*.log
+.claude/*.tmp
+.claude/.change-factory-doctor
