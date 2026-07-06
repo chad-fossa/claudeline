@@ -3,6 +3,21 @@
 All notable changes to this project follow [Semantic Versioning](https://semver.org).
 Each release corresponds to a `vMAJOR.MINOR.PATCH` git tag.
 
+## v0.5.0 (2026-07-06)
+
+### Fixes
+- **Cross-profile cache/lock collisions**: Symptom: personal statusline showed work's usage numbers. The PR-view cache, branch cache, and lock files were keyed only by repo name, so work and personal sessions in the same repo clobbered each other's PR data; the usage cache and account label used inconsistent detection logic between `statusline-command.sh` and `hooks/show-usage-limits.sh`. Consolidated account detection into one `detect_account()` (kept in sync across both files) and keyed PR cache/branch/lock files by account as well as repo name.
+- **Account detection distinguishes unset vs empty `CLAUDE_CONFIG_DIR`**: Previously an unset var and an explicit `CLAUDE_CONFIG_DIR=""` were treated the same, silently assuming "work". Now an unset `CLAUDE_CONFIG_DIR` is flagged as an assumption and the account label renders dimmed to signal it wasn't explicitly detected.
+- **Hook path is profile-aware**: `USAGE_REFRESH_HOOK` previously always pointed at `$HOME/.claude/hooks/show-usage-limits.sh` regardless of active profile. Now resolves the active `CLAUDE_CONFIG_DIR`'s own hook first, falling back to the work install if the profile doesn't have one.
+- **`install.sh` honors `CLAUDE_CONFIG_DIR`**: The installer previously always targeted `~/.claude`. It now installs into `$CLAUDE_CONFIG_DIR` when set, so a personal profile can be installed directly instead of only via symlinking from work.
+
+### Added
+- **Cross-profile identity markers**: Since macOS Keychain has only one slot for the Claude Max OAuth token, both profiles can end up silently sharing (or worse, mismatching) logins. claudeline now surfaces this instead of rendering silently wrong/unverifiable numbers: a dim `=` after the account label when both profiles share the same login, a dim `?` after the usage segment (macOS only) when the profiles have different logins and the shown numbers can't be verified to belong to the active one, and a dimmed account label when the account was assumed rather than explicitly detected. See [Cross-profile identity markers](README.md#cross-profile-identity-markers).
+- **`scripts/test.sh`**: Smoke-test harness validating account detection, cache keying, and marker rendering (36 cases).
+
+### Known issues
+- **macOS Keychain single-slot limitation is unchanged** — [anthropics/claude-code#20553](https://github.com/anthropics/claude-code/issues/20553) still means both profiles can end up authenticated as the same account, or a stale token can serve the wrong profile's numbers, on macOS. This release does not fix that; it makes the mismatched/unverifiable state *visible* via the `?` marker instead of silently rendering the wrong numbers. A token-identity probe that would auto-detect the mismatch (rather than infer it from `.claude.json` account UUIDs) is descoped pending verification of a suitable API endpoint.
+
 ## v0.4.0 (2026-05-24)
 
 ### Features

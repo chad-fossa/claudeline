@@ -80,7 +80,7 @@ alias claude-personal="CLAUDE_CONFIG_DIR=$HOME/.claude-personal claude"
 
 2. Run `claude-personal` and authenticate with your personal account.
 
-3. Symlink shared config from work to personal:
+3. Either symlink shared config from work to personal:
 
 ```bash
 shared=(CLAUDE.md settings.json skills statusline-command.sh hooks plugins
@@ -93,12 +93,29 @@ for item in "${shared[@]}"; do
 done
 ```
 
+   ...or install claudeline directly into the personal profile instead:
+
+```bash
+CLAUDE_CONFIG_DIR=$HOME/.claude-personal ./install.sh
+```
+
 ### How it works
 
 - Credentials are stored per-account (macOS Keychain entries on Darwin, `$CLAUDE_CONFIG_DIR/.credentials.json` on Linux)
 - The statusline shows `[W]` or `[P]` when both `~/.claude` and `~/.claude-personal` exist
 - Usage limits are cached per-account so they don't clobber each other
 - `claude` (no alias) uses `~/.claude` by default — your work account
+- macOS Keychain has only one slot for the Claude Max OAuth token, so both profiles can end up silently sharing the same login — see [Cross-profile identity markers](#cross-profile-identity-markers) and [anthropics/claude-code#20553](https://github.com/anthropics/claude-code/issues/20553) (still open upstream, unfixed)
+
+### Cross-profile identity markers
+
+claudeline can't fix the shared-keychain-slot issue above, but it detects it and flags it instead of silently showing the wrong numbers:
+
+| Marker | Meaning |
+|--------|---------|
+| Dim `=` after the account label (e.g. `[P]=`) | Both profiles are logged into the *same* account. |
+| Dim `?` after the usage segment (macOS only) | The two profiles have different logins, so the usage numbers shown may belong to the wrong one — treat them as unverified. |
+| Account label itself dimmed (e.g. `[W]`) | The account was assumed (`CLAUDE_CONFIG_DIR` unset) rather than explicitly detected. |
 
 ### Customizing account labels
 
