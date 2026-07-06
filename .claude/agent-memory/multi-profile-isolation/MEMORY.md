@@ -7,3 +7,6 @@
 
 ## Incidents
 - [2026-07-06 incident](2026-07-06_incident.md) — personal statusline showed work's usage numbers; classic keychain-slot symptom; dotfiles-symlink deployment
+
+## Design
+- [Shipped v0.5.0 marker design](shipped_marker_design.md) — markers infer from `.claude.json` accountUuid (`=` shared, `?` differ), NOT a token probe; the probe was descoped — no `⚠`/`fetched_account` in the tree
