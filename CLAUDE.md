@@ -61,6 +61,14 @@ cat /tmp/.claude_usage_limits_personal.json
 
 The cache file is what the statusline reads — if it doesn't exist or is stale, the `5h:X% 7d:X%` segment won't render.
 
+`scripts/test.sh` is this repo's smoke-test harness — no CI runs it, so run it manually before landing changes:
+
+```bash
+bash scripts/test.sh
+```
+
+It asserts the load-bearing invariant that `detect_account()` is duplicated verbatim across `statusline-command.sh` and `hooks/show-usage-limits.sh` (the two files install independently via curl, so no shared lib) — the two copies must stay identical.
+
 ## Known upstream constraints
 
 - macOS Keychain stores only one Claude Max OAuth token (`Claude Code-credentials`); `/login` on a second account overwrites the first. Tracked at [anthropics/claude-code#20553](https://github.com/anthropics/claude-code/issues/20553). Work around by re-`/login`-ing on switch.

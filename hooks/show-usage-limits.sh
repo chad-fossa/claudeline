@@ -4,7 +4,7 @@
 # The statusline script reads from this cache
 
 # Per-account cache — detect from CLAUDE_CONFIG_DIR or default to "work"
-# keep in sync with statusline-command.sh detect_account()
+# keep in sync with statusline-command.sh detect_account() — scripts/test.sh asserts they match
 detect_account() {
   ACCOUNT_ASSUMED=0
   if [[ -z "${CLAUDE_CONFIG_DIR+x}" ]]; then

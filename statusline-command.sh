@@ -47,7 +47,7 @@ CWD=$(echo "$INPUT" | jq -r '.workspace.current_dir // .workspace.project_dir //
 # ─────────────────────────────────────────────────────────────
 # Detect from CLAUDE_CONFIG_DIR env var (set by shell alias), not transcript_path
 # (transcript_path follows symlinks, so personal→work projects resolve to /.claude/)
-# keep in sync with hooks/show-usage-limits.sh detect_account()
+# keep in sync with hooks/show-usage-limits.sh detect_account() — scripts/test.sh asserts they match
 detect_account() {
   ACCOUNT_ASSUMED=0
   if [[ -z "${CLAUDE_CONFIG_DIR+x}" ]]; then
