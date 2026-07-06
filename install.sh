@@ -5,7 +5,7 @@
 set -e
 
 REPO="https://raw.githubusercontent.com/chad-fossa/claudeline/main"
-CLAUDE_DIR="$HOME/.claude"
+CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 
 echo "Installing claudeline..."
 
@@ -49,40 +49,40 @@ if [[ -f "$SETTINGS" ]]; then
   echo "  Backed up existing settings to settings.json.bak"
 
   # Merge statusLine and hooks into existing settings
-  MERGED=$(jq '
+  MERGED=$(jq --arg dir "$CLAUDE_DIR" '
     .statusLine = {
       "type": "command",
-      "command": ("bash " + env.HOME + "/.claude/statusline-command.sh")
+      "command": ("bash " + $dir + "/statusline-command.sh")
     } |
     .hooks.SessionStart = [
       {
         "matcher": "startup",
-        "hooks": [{"type": "command", "command": (env.HOME + "/.claude/hooks/show-usage-limits.sh")}]
+        "hooks": [{"type": "command", "command": ($dir + "/hooks/show-usage-limits.sh")}]
       },
       {
         "matcher": "compact",
-        "hooks": [{"type": "command", "command": (env.HOME + "/.claude/hooks/show-usage-limits.sh")}]
+        "hooks": [{"type": "command", "command": ($dir + "/hooks/show-usage-limits.sh")}]
       }
     ]
   ' "$SETTINGS")
   echo "$MERGED" > "$SETTINGS"
 else
   # Create new settings
-  jq -n '{
+  jq -n --arg dir "$CLAUDE_DIR" '{
     "$schema": "https://json.schemastore.org/claude-code-settings.json",
     "statusLine": {
       "type": "command",
-      "command": ("bash " + env.HOME + "/.claude/statusline-command.sh")
+      "command": ("bash " + $dir + "/statusline-command.sh")
     },
     "hooks": {
       "SessionStart": [
         {
           "matcher": "startup",
-          "hooks": [{"type": "command", "command": (env.HOME + "/.claude/hooks/show-usage-limits.sh")}]
+          "hooks": [{"type": "command", "command": ($dir + "/hooks/show-usage-limits.sh")}]
         },
         {
           "matcher": "compact",
-          "hooks": [{"type": "command", "command": (env.HOME + "/.claude/hooks/show-usage-limits.sh")}]
+          "hooks": [{"type": "command", "command": ($dir + "/hooks/show-usage-limits.sh")}]
         }
       ]
     }
