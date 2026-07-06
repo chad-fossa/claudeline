@@ -7,3 +7,5 @@
 .claude/*.log
 .claude/*.tmp
 .claude/.change-factory-doctor
+.claude/agent-memory/change-factory-*
+.claude/validator/
