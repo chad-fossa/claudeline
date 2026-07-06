@@ -47,12 +47,24 @@ CWD=$(echo "$INPUT" | jq -r '.workspace.current_dir // .workspace.project_dir //
 # ─────────────────────────────────────────────────────────────
 # Detect from CLAUDE_CONFIG_DIR env var (set by shell alias), not transcript_path
 # (transcript_path follows symlinks, so personal→work projects resolve to /.claude/)
-if [[ "${CLAUDE_CONFIG_DIR:-}" == *"claude-personal"* ]]; then
-  ACCOUNT_ID="personal"
+# keep in sync with hooks/show-usage-limits.sh detect_account()
+detect_account() {
+  ACCOUNT_ASSUMED=0
+  if [[ -z "${CLAUDE_CONFIG_DIR+x}" ]]; then
+    ACCOUNT_ID="work"
+    ACCOUNT_ASSUMED=1
+  elif [[ "$CLAUDE_CONFIG_DIR" == *"claude-personal"* ]]; then
+    ACCOUNT_ID="personal"
+  else
+    ACCOUNT_ID="work"
+  fi
+}
+detect_account
+
+if [[ "$ACCOUNT_ID" == "personal" ]]; then
   ACCOUNT_LABEL="${CLAUDE_ACCOUNT_PERSONAL_LABEL:-P}"
   ACCOUNT_COLOR="${CLAUDE_ACCOUNT_PERSONAL_COLOR:-$MAGENTA}"
 else
-  ACCOUNT_ID="work"
   ACCOUNT_LABEL="${CLAUDE_ACCOUNT_WORK_LABEL:-W}"
   ACCOUNT_COLOR="${CLAUDE_ACCOUNT_WORK_COLOR:-$CYAN}"
 fi
@@ -246,8 +258,8 @@ get_branch() {
 
 get_pr_number() {
   local repo_name=$1 branch=$2
-  local cache="/tmp/.claude_pr_cache_${repo_name}"
-  local branch_cache="/tmp/.claude_pr_branch_${repo_name}"
+  local cache="/tmp/.claude_pr_cache_${repo_name}_${ACCOUNT_ID}"
+  local branch_cache="/tmp/.claude_pr_branch_${repo_name}_${ACCOUNT_ID}"
 
   # Check cache
   if [[ -f "$cache" && -f "$branch_cache" ]]; then
@@ -261,7 +273,7 @@ get_pr_number() {
   fi
 
   # Fetch PR — skip if another fetch is already in flight
-  local lock="/tmp/.claude_pr_lock_${repo_name}"
+  local lock="/tmp/.claude_pr_lock_${repo_name}_${ACCOUNT_ID}"
   # Expire stale locks older than 10 seconds (crash guard)
   if [[ -f "$lock" ]]; then
     local lock_age

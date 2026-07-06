@@ -4,11 +4,24 @@
 # The statusline script reads from this cache
 
 # Per-account cache — detect from CLAUDE_CONFIG_DIR or default to "work"
-if [[ "${CLAUDE_CONFIG_DIR:-}" == *"claude-personal"* ]]; then
-  _ACCT_ID="personal"
+# keep in sync with statusline-command.sh detect_account()
+detect_account() {
+  ACCOUNT_ASSUMED=0
+  if [[ -z "${CLAUDE_CONFIG_DIR+x}" ]]; then
+    ACCOUNT_ID="work"
+    ACCOUNT_ASSUMED=1
+  elif [[ "$CLAUDE_CONFIG_DIR" == *"claude-personal"* ]]; then
+    ACCOUNT_ID="personal"
+  else
+    ACCOUNT_ID="work"
+  fi
+}
+detect_account
+_ACCT_ID="$ACCOUNT_ID"
+
+if [[ "$_ACCT_ID" == "personal" ]]; then
   _CREDS_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude-personal}"
 else
-  _ACCT_ID="work"
   _CREDS_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 fi
 readonly CACHE_FILE="/tmp/.claude_usage_limits_${_ACCT_ID}.json"
