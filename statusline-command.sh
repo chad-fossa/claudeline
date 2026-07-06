@@ -85,7 +85,18 @@ fi
 # ─────────────────────────────────────────────────────────────
 readonly USAGE_CACHE="/tmp/.claude_usage_limits_${ACCOUNT_ID}.json"
 readonly USAGE_CACHE_TTL_SECONDS=300
-readonly USAGE_REFRESH_HOOK="$HOME/.claude/hooks/show-usage-limits.sh"
+
+# Prefer the active profile's own hook; fall back to the work install
+# if the profile doesn't have one (e.g. a personal dir with no hooks/).
+resolve_usage_refresh_hook() {
+  local preferred="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/show-usage-limits.sh"
+  if [[ -x "$preferred" ]]; then
+    echo "$preferred"
+  else
+    echo "$HOME/.claude/hooks/show-usage-limits.sh"
+  fi
+}
+readonly USAGE_REFRESH_HOOK="$(resolve_usage_refresh_hook)"
 
 # Spawn a background refresh of the usage cache when it's stale.
 # Render uses whatever cache is currently on disk (no API latency); the
@@ -151,7 +162,10 @@ get_usage_limits() {
   ((pct7 >= 80)) && color7=$RED
   ((pct7 >= 50 && pct7 < 80)) && color7=$YELLOW
 
-  printf '%s%s:%s%s%d%%%s %s%s:%s%s%d%%%s %s│%s' "$DIM" "$label5" "$RESET" "$color5" "$pct5" "$RESET" "$DIM" "$label7" "$RESET" "$color7" "$pct7" "$RESET" "$DIM" "$RESET"
+  local unverifiable
+  unverifiable=$(unverifiable_marker "$(profile_uuid_state)")
+
+  printf '%s%s:%s%s%d%%%s %s%s:%s%s%d%%%s %s│%s%s' "$DIM" "$label5" "$RESET" "$color5" "$pct5" "$RESET" "$DIM" "$label7" "$RESET" "$color7" "$pct7" "$RESET" "$DIM" "$RESET" "$unverifiable"
 }
 
 # ─────────────────────────────────────────────────────────────
@@ -350,6 +364,41 @@ truncate() {
 }
 
 # ─────────────────────────────────────────────────────────────
+# Cross-profile identity (keychain has one OAuth slot — see
+# anthropics/claude-code#20553 — so both profiles can silently
+# share the same logged-in account)
+# ─────────────────────────────────────────────────────────────
+profile_uuid_state() {
+  local work_dir="$HOME/.claude" personal_dir="$HOME/.claude-personal"
+  if [[ ! -d "$work_dir" || ! -d "$personal_dir" ]]; then
+    echo "single"
+    return
+  fi
+
+  local work_uuid personal_uuid
+  work_uuid=$(jq -r '.oauthAccount.accountUuid // empty' "$work_dir/.claude.json" 2>/dev/null)
+  personal_uuid=$(jq -r '.oauthAccount.accountUuid // empty' "$personal_dir/.claude.json" 2>/dev/null)
+
+  if [[ -z "$work_uuid" || -z "$personal_uuid" ]]; then
+    echo "unknown"
+  elif [[ "$work_uuid" == "$personal_uuid" ]]; then
+    echo "equal"
+  else
+    echo "differ"
+  fi
+}
+
+shared_login_marker() {
+  local state=$1
+  [[ "$state" == "equal" ]] && printf '%s=%s' "$DIM" "$RESET"
+}
+
+unverifiable_marker() {
+  local state=$1
+  [[ "$OSTYPE" == darwin* && "$state" == "differ" ]] && printf ' %s?%s' "$DIM" "$RESET"
+}
+
+# ─────────────────────────────────────────────────────────────
 # Build output
 # ─────────────────────────────────────────────────────────────
 build_output() {
@@ -359,7 +408,11 @@ build_output() {
   # Show account label if multiple accounts exist
   local acct_prefix=""
   if [[ -n "$ACCOUNT_LABEL" && -d "$HOME/.claude-personal" && -d "$HOME/.claude" ]]; then
-    acct_prefix=$(printf '%s[%s]%s ' "$ACCOUNT_COLOR" "$ACCOUNT_LABEL" "$RESET")
+    local label_color="$ACCOUNT_COLOR"
+    ((ACCOUNT_ASSUMED)) && label_color="$DIM"
+    local shared_marker
+    shared_marker=$(shared_login_marker "$(profile_uuid_state)")
+    acct_prefix=$(printf '%s[%s]%s%s ' "$label_color" "$ACCOUNT_LABEL" "$RESET" "$shared_marker")
   fi
 
   if is_git_repo; then
