@@ -81,16 +81,31 @@ get_token() {
 
   # File present but no usable token (empty file, malformed JSON, or
   # valid JSON missing the field) — distinct from the silent absent-file
-  # case above: this gets one loud diagnostic + artifact before falling
-  # back to Keychain, since an existing-but-broken credentials file is
-  # itself worth knowing about.
+  # case above.
   if [[ -z "$access_token" ]]; then
-    echo "${DIM}Usage: ${creds_file} exists but has no usable OAuth token (empty or malformed) — falling back to Keychain${RESET}" >&2
-    printf '%s malformed_or_empty_credentials\n' "$(date +%s)" > "${RUNTIME_DIR}/.claude_cred_malformed_${ACCOUNT_ID}"
+    log_malformed_credentials "$creds_file"
     fetch_token_from_keychain
     return $?
   fi
 
+  resolve_file_credentials "$creds_file" "$access_token"
+  return $?
+}
+
+# File present but no usable token — one loud diagnostic + artifact
+# before get_token falls back to Keychain, since an existing-but-broken
+# credentials file is itself worth knowing about (unlike an absent one).
+log_malformed_credentials() {
+  local creds_file=$1
+  echo "${DIM}Usage: ${creds_file} exists but has no usable OAuth token (empty or malformed) — falling back to Keychain${RESET}" >&2
+  printf '%s malformed_or_empty_credentials\n' "$(date +%s)" > "${RUNTIME_DIR}/.claude_cred_malformed_${ACCOUNT_ID}"
+}
+
+# Decides the fate of a present, well-formed file token: still valid,
+# needs a refresh, or its refresh token has itself expired. Sets the same
+# TOKEN/TOKEN_SOURCE globals get_token does — only ever called from there.
+resolve_file_credentials() {
+  local creds_file=$1 access_token=$2
   local expires_at refresh_expires_at now_ms
   expires_at=$(jq -r '.claudeAiOauth.expiresAt // empty' "$creds_file" 2>/dev/null)
   refresh_expires_at=$(jq -r '.claudeAiOauth.refreshTokenExpiresAt // empty' "$creds_file" 2>/dev/null)
@@ -190,6 +205,76 @@ release_cred_lock() {
   _CRED_LOCK_PREV_TRAP=""
 }
 
+# POSTs the refresh grant and parses the response. Sets ACCESS_TOKEN /
+# NEW_REFRESH_TOKEN / NEW_EXPIRES_AT on success, or REFRESH_FAIL_REASON /
+# REFRESH_FAIL_BODY (error/error_description only — an OAuth error body
+# never carries a token, but extracting just these two fields keeps that
+# guarantee explicit rather than assumed) on failure. --data @- (body
+# piped via stdin) instead of -d "$body": a -d/-H value is visible in
+# this process's argv (e.g. to `ps`) for as long as curl runs, and the
+# refresh token IS this body.
+_post_refresh_grant() {
+  local refresh_token=$1 client_id=$2 scopes=$3
+  local body response http_code payload
+  body=$(jq -n --arg rt "$refresh_token" --arg cid "$client_id" --arg scope "$scopes" \
+    '{grant_type: "refresh_token", refresh_token: $rt, client_id: $cid, scope: $scope}')
+
+  # response-splitting idiom (-w appends the status code after a \n, then
+  # peel it back off) — kept in sync with scripts/capture-profile-
+  # session.sh's verify_capture_identity, the only other curl call site
+  # using it.
+  response=$(printf '%s' "$body" | curl -s -w '\n%{http_code}' --max-time 5 \
+    -X POST "https://platform.claude.com/v1/oauth/token" \
+    -H "Content-Type: application/json" \
+    --data @- 2>/dev/null)
+  http_code="${response##*$'\n'}"
+  payload="${response%$'\n'*}"
+
+  if [[ "$http_code" != "200" ]] || ! echo "$payload" | jq -e . >/dev/null 2>&1; then
+    REFRESH_FAIL_REASON="http_${http_code:-timeout}"
+    REFRESH_FAIL_BODY=$(echo "$payload" | jq -r '[(.error // ""), (.error_description // "")] | join(" ")' 2>/dev/null)
+    return 1
+  fi
+
+  ACCESS_TOKEN=$(echo "$payload" | jq -r '.access_token // empty')
+  NEW_REFRESH_TOKEN=$(echo "$payload" | jq -r '.refresh_token // empty')
+  local expires_in
+  expires_in=$(echo "$payload" | jq -r '.expires_in // empty')
+
+  if [[ -z "$ACCESS_TOKEN" || -z "$expires_in" ]]; then
+    REFRESH_FAIL_REASON="parse_failure"
+    REFRESH_FAIL_BODY=$(echo "$payload" | jq -r '[(.error // ""), (.error_description // "")] | join(" ")' 2>/dev/null)
+    return 1
+  fi
+
+  [[ -z "$NEW_REFRESH_TOKEN" ]] && NEW_REFRESH_TOKEN="$refresh_token"
+  local now_ms
+  now_ms=$(( $(date +%s) * 1000 ))
+  NEW_EXPIRES_AT=$(( now_ms + expires_in * 1000 ))
+  return 0
+}
+
+# Atomically rewrites creds_file with the new ACCESS_TOKEN/NEW_REFRESH_
+# TOKEN/NEW_EXPIRES_AT triple _post_refresh_grant set, then deletes the
+# pre-write .bak now that the mv is safely done. umask 077 for the window
+# between jq's write and chmod: without it, the tmp file briefly exists
+# at the process's default (often world-readable) mode before chmod 600
+# catches up — this closes that window instead of narrowing it after the
+# fact.
+_rotate_creds_file() {
+  local creds_file=$1 bak_file=$2
+  local tmp_file="${creds_file}.tmp"
+  (
+    umask 077
+    jq --arg at "$ACCESS_TOKEN" --arg rt "$NEW_REFRESH_TOKEN" --argjson exp "$NEW_EXPIRES_AT" \
+      '.claudeAiOauth.accessToken = $at | .claudeAiOauth.refreshToken = $rt | .claudeAiOauth.expiresAt = $exp' \
+      "$creds_file" > "$tmp_file"
+  )
+  chmod 600 "$tmp_file"
+  mv "$tmp_file" "$creds_file"
+  rm -f "$bak_file"
+}
+
 # Refresh the file-based OAuth token by POSTing the stored refresh_token
 # to Anthropic's OAuth endpoint. Refuses on ACCOUNT_ASSUMED (no writes on
 # a guessed identity) and when another refresh is already in flight (see
@@ -221,69 +306,20 @@ refresh_token_grant() {
     return 1
   fi
 
-  # .bak exists only to cover the write-failure window between here and a
-  # verified-successful mv below — chmod 600 explicitly (cp doesn't
-  # guarantee the mode of an existing source survives, and this file
-  # holds a live refresh token) and delete it once the new file is
-  # safely in place.
+  # .bak exists only to cover the write-failure window between here and
+  # a verified-successful _rotate_creds_file mv — chmod 600 explicitly
+  # (cp doesn't guarantee the mode of an existing source survives) since
+  # this file holds a live refresh token.
   local bak_file="${creds_file}.bak"
   cp "$creds_file" "$bak_file"
   chmod 600 "$bak_file"
 
-  # --data @- (body piped via stdin) instead of -d "$body": a -d/-H value
-  # is visible in this process's argv (e.g. to `ps`) for as long as curl
-  # runs. The refresh token is IN this body, so it never goes on argv.
-  local body response http_code payload
-  body=$(jq -n --arg rt "$refresh_token" --arg cid "$client_id" --arg scope "$scopes" \
-    '{grant_type: "refresh_token", refresh_token: $rt, client_id: $cid, scope: $scope}')
-
-  response=$(printf '%s' "$body" | curl -s -w '\n%{http_code}' --max-time 5 \
-    -X POST "https://platform.claude.com/v1/oauth/token" \
-    -H "Content-Type: application/json" \
-    --data @- 2>/dev/null)
-  http_code="${response##*$'\n'}"
-  payload="${response%$'\n'*}"
-
-  if [[ "$http_code" != "200" ]] || ! echo "$payload" | jq -e . >/dev/null 2>&1; then
-    REFRESH_FAIL_REASON="http_${http_code:-timeout}"
-    # error/error_description only — an OAuth error body never carries a
-    # token, but extracting just these two fields (rather than logging
-    # $payload raw) keeps that guarantee explicit rather than assumed.
-    REFRESH_FAIL_BODY=$(echo "$payload" | jq -r '[(.error // ""), (.error_description // "")] | join(" ")' 2>/dev/null)
+  if ! _post_refresh_grant "$refresh_token" "$client_id" "$scopes"; then
     release_cred_lock
     return 1
   fi
 
-  local access_token new_refresh_token expires_in now_ms new_expires_at
-  access_token=$(echo "$payload" | jq -r '.access_token // empty')
-  new_refresh_token=$(echo "$payload" | jq -r '.refresh_token // empty')
-  expires_in=$(echo "$payload" | jq -r '.expires_in // empty')
-
-  if [[ -z "$access_token" || -z "$expires_in" ]]; then
-    REFRESH_FAIL_REASON="parse_failure"
-    REFRESH_FAIL_BODY=$(echo "$payload" | jq -r '[(.error // ""), (.error_description // "")] | join(" ")' 2>/dev/null)
-    release_cred_lock
-    return 1
-  fi
-
-  [[ -z "$new_refresh_token" ]] && new_refresh_token="$refresh_token"
-  now_ms=$(( $(date +%s) * 1000 ))
-  new_expires_at=$(( now_ms + expires_in * 1000 ))
-
-  # umask 077 for the window between jq's write and chmod: without it,
-  # the tmp file briefly exists at the process's default (often
-  # world-readable) mode before chmod 600 catches up — this closes that
-  # window instead of narrowing it after the fact.
-  local tmp_file="${creds_file}.tmp"
-  (
-    umask 077
-    jq --arg at "$access_token" --arg rt "$new_refresh_token" --argjson exp "$new_expires_at" \
-      '.claudeAiOauth.accessToken = $at | .claudeAiOauth.refreshToken = $rt | .claudeAiOauth.expiresAt = $exp' \
-      "$creds_file" > "$tmp_file"
-  )
-  chmod 600 "$tmp_file"
-  mv "$tmp_file" "$creds_file"
-  rm -f "$bak_file"
+  _rotate_creds_file "$creds_file" "$bak_file"
 
   release_cred_lock
   return 0
@@ -419,13 +455,24 @@ maybe_auto_capture() {
   [[ "$profile_fetched_at" == "$attempted_value" ]] && return 0
 
   acquire_cred_lock || return 0
+  attempt_auto_capture "$profile_fetched_at" "$claude_json"
+  release_cred_lock
+  return 0
+}
 
+# Runs the mdat-corroboration veto check and, if it passes, invokes the
+# capture script — assumes the cred lock is already held by the caller
+# (maybe_auto_capture). Every path (mdat-read failure, veto, missing
+# script, or an actual invoke) calls record_capture_attempt so a repeat
+# render for this same login skips entirely via maybe_auto_capture's
+# probe-storm guard above.
+attempt_auto_capture() {
+  local profile_fetched_at=$1 claude_json=$2
   local window="${CLAUDELINE_CAPTURE_WINDOW_SECS:-30}"
   local mdat_epoch profile_fetched_sec delta
   mdat_epoch=$(read_keychain_mdat_epoch)
   if [[ -z "$mdat_epoch" ]]; then
     record_capture_attempt "$profile_fetched_at"
-    release_cred_lock
     return 0
   fi
   profile_fetched_sec=$((profile_fetched_at / 1000))
@@ -442,7 +489,6 @@ maybe_auto_capture() {
       "$(date +%s)" "$delta" "$window" "$profile_fetched_at" "$mdat_epoch" "$cap_uuid" "$cap_email" > "$artifact"
     echo "${DIM}Usage: auto-capture vetoed for ${cap_email} (${cap_uuid}) — keychain/login timing outside ${window}s window (delta=${delta}s)${RESET}" >&2
     record_capture_attempt "$profile_fetched_at"
-    release_cred_lock
     return 0
   fi
 
@@ -451,16 +497,12 @@ maybe_auto_capture() {
   if [[ ! -f "$capture_script" ]]; then
     echo "${DIM}Usage: auto-capture skipped for ${cap_email} (${cap_uuid}) — capture script not found at ${capture_script}${RESET}" >&2
     record_capture_attempt "$profile_fetched_at"
-    release_cred_lock
     return 0
   fi
 
   echo "${DIM}Usage: auto-capturing session for ${cap_email} (${cap_uuid})${RESET}" >&2
   CLAUDELINE_PROFILE_FETCHED_AT="$profile_fetched_at" CLAUDE_CONFIG_DIR="$_CREDS_DIR" bash "$capture_script" >/dev/null 2>&1
   record_capture_attempt "$profile_fetched_at"
-
-  release_cred_lock
-  return 0
 }
 
 # Fetch usage limits from API

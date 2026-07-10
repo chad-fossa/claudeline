@@ -133,6 +133,9 @@ verify_capture_identity() {
   chmod 600 "$header_file"
   printf 'Authorization: Bearer %s\n' "$token" > "$header_file"
 
+  # response-splitting idiom (-w appends the status code after a \n, then
+  # peel it back off) — kept in sync with hooks/show-usage-limits.sh's
+  # _post_refresh_grant, the only other curl call site using it.
   local response http_code payload
   response=$(curl -s -w '\n%{http_code}' --max-time 5 \
     -H @"$header_file" \

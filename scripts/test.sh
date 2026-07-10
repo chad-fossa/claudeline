@@ -183,7 +183,11 @@ echo '{"oauthAccount":{"accountUuid":"same-uuid"}}' > "$HOME/.claude-personal/.c
 # ─────────────────────────────────────────────────────────────
 GET_TOKEN_SRC=$(extract_func "$HOOK" get_token)
 FTK_SRC=$(extract_func "$HOOK" fetch_token_from_keychain)
+LMC_SRC=$(extract_func "$HOOK" log_malformed_credentials)
+RFC_SRC=$(extract_func "$HOOK" resolve_file_credentials)
 eval "$FTK_SRC"
+eval "$LMC_SRC"
+eval "$RFC_SRC"
 eval "$GET_TOKEN_SRC"
 
 SECSTUB=$(mktemp -d)
@@ -254,6 +258,11 @@ RCL_SRC=$(extract_func "$HOOK" release_cred_lock)
 eval "$CLD_SRC"
 eval "$ACL_SRC"
 eval "$RCL_SRC"
+
+PRG_SRC=$(extract_func "$HOOK" _post_refresh_grant)
+RCF_SRC=$(extract_func "$HOOK" _rotate_creds_file)
+eval "$PRG_SRC"
+eval "$RCF_SRC"
 
 REFRESH_SRC=$(extract_func "$HOOK" refresh_token_grant)
 eval "$REFRESH_SRC"
@@ -434,6 +443,7 @@ rm -rf "$FUCURL"
 # critical finding).
 # ─────────────────────────────────────────────────────────────
 MAC_SRC=$(extract_func "$HOOK" maybe_auto_capture)
+AAC_SRC=$(extract_func "$HOOK" attempt_auto_capture)
 RKM_SRC=$(extract_func "$HOOK" read_keychain_mdat_epoch)
 RCS_SRC=$(extract_func "$HOOK" resolve_capture_script)
 ACS_SRC=$(extract_func "$HOOK" auto_capture_sentinel)
@@ -443,6 +453,7 @@ eval "$RKM_SRC"
 eval "$RCS_SRC"
 eval "$ACS_SRC"
 eval "$RCA_SRC"
+eval "$AAC_SRC"
 eval "$MAC_SRC"
 
 epoch_to_mdat_ts() {
