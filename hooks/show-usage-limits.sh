@@ -42,24 +42,64 @@ else
   fmt_epoch()     { date -d "@$1" "$2" 2>/dev/null; }
 fi
 
-# Get OAuth token: macOS Keychain on Darwin, ~/.claude/.credentials.json on Linux.
+# Get OAuth token: this profile's .credentials.json FIRST on every platform
+# (claudeline-owned refresh via refresh_token_grant), macOS Keychain as
+# fallback only when the file is absent (Darwin only; Linux returns 1).
+# Sets globals TOKEN and TOKEN_SOURCE (file | file-refresh-failed | keychain |
+# unknown) instead of echoing — a caller wrapping this in $(...) would lose
+# TOKEN_SOURCE to the command-substitution subshell.
 get_token() {
-  local creds
+  TOKEN=""
+  TOKEN_SOURCE="unknown"
+  local creds_file="${_CREDS_DIR}/.credentials.json"
+
+  if [[ -f "$creds_file" ]]; then
+    local access_token
+    access_token=$(jq -r '.claudeAiOauth.accessToken // empty' "$creds_file" 2>/dev/null)
+
+    if [[ -n "$access_token" ]]; then
+      local expires_at refresh_expires_at now_ms
+      expires_at=$(jq -r '.claudeAiOauth.expiresAt // empty' "$creds_file" 2>/dev/null)
+      refresh_expires_at=$(jq -r '.claudeAiOauth.refreshTokenExpiresAt // empty' "$creds_file" 2>/dev/null)
+      now_ms=$(( $(date +%s) * 1000 ))
+
+      if [[ -n "$expires_at" && "$expires_at" -gt $((now_ms + 60000)) ]]; then
+        TOKEN_SOURCE="file"
+        TOKEN="$access_token"
+        return 0
+      fi
+
+      if [[ -n "$refresh_expires_at" && "$refresh_expires_at" -lt "$now_ms" ]]; then
+        TOKEN_SOURCE="file-refresh-failed"
+        REFRESH_FAIL_REASON="refresh_token_expired"
+        return 1
+      fi
+
+      if refresh_token_grant; then
+        TOKEN_SOURCE="file"
+        TOKEN=$(jq -r '.claudeAiOauth.accessToken // empty' "$creds_file" 2>/dev/null)
+        return 0
+      fi
+
+      TOKEN_SOURCE="file-refresh-failed"
+      return 1
+    fi
+  fi
+
   if [[ "$OSTYPE" == "darwin"* ]]; then
     # The Claude Max OAuth token lives in "Claude Code-credentials" regardless of
     # CLAUDE_CONFIG_DIR — keychain isn't isolated per config dir, last /login wins.
     # Hashed entries (Claude Code-credentials-{hash}) only hold MCP tokens with
     # empty accessToken fields, not the Max claudeAiOauth we need.
     # jq can fail on MCP-bloated entries truncated at keychain's output limit, so use grep.
+    TOKEN_SOURCE="keychain"
+    local creds
     creds=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null) || return 1
-    echo "$creds" | grep -o '"claudeAiOauth":{"accessToken":"[^"]*"' \
+    TOKEN=$(echo "$creds" | grep -o '"claudeAiOauth":{"accessToken":"[^"]*"' \
       | head -1 \
-      | sed 's/"claudeAiOauth":{"accessToken":"//;s/"$//'
+      | sed 's/"claudeAiOauth":{"accessToken":"//;s/"$//')
   else
-    # Linux: Claude Code persists OAuth to a file under the config dir.
-    local creds_file="${_CREDS_DIR}/.credentials.json"
-    [[ -f "$creds_file" ]] || return 1
-    jq -r '.claudeAiOauth.accessToken // empty' "$creds_file" 2>/dev/null
+    return 1
   fi
 }
 
@@ -115,8 +155,8 @@ main() {
   local input
   input=$(cat)
 
-  local token
-  token=$(get_token)
+  get_token
+  local token="$TOKEN"
   if [[ -z "$token" ]]; then
     echo "${DIM}Usage: Could not get credentials${RESET}" >&2
     exit 0

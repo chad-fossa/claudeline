@@ -160,6 +160,47 @@ mkdir -p "$HOME/.claude-personal"
 echo '{"oauthAccount":{"accountUuid":"same-uuid"}}' > "$HOME/.claude-personal/.claude.json"
 
 # ─────────────────────────────────────────────────────────────
+# Area: file-first token + TOKEN_SOURCE (get_token)
+# ─────────────────────────────────────────────────────────────
+GET_TOKEN_SRC=$(extract_func "$HOOK" get_token)
+eval "$GET_TOKEN_SRC"
+
+SECSTUB=$(mktemp -d)
+SECURITY_STUB_SENTINEL="$SECSTUB/security_called"
+cat > "$SECSTUB/security" <<EOF
+#!/bin/bash
+touch "$SECURITY_STUB_SENTINEL"
+echo '{"claudeAiOauth":{"accessToken":"tok_fake_keychain"}}'
+EOF
+chmod +x "$SECSTUB/security"
+export PATH="$SECSTUB:$PATH"
+
+CREDS_TEST_DIR=$(mktemp -d)
+_CREDS_DIR="$CREDS_TEST_DIR"
+OSTYPE="darwin24"
+
+future_ms=$(( ($(date +%s) + 3600) * 1000 ))
+cat > "$CREDS_TEST_DIR/.credentials.json" <<EOF
+{"claudeAiOauth":{"accessToken":"tok_fake_valid","expiresAt":$future_ms,"refreshToken":"rtok_fake","refreshTokenExpiresAt":$((future_ms + 1000000))}}
+EOF
+
+rm -f "$SECURITY_STUB_SENTINEL"
+get_token
+assert_eq "file-first: valid unexpired file returns file token" "tok_fake_valid" "$TOKEN"
+assert_eq "file-first: TOKEN_SOURCE=file" "file" "$TOKEN_SOURCE"
+[[ ! -f "$SECURITY_STUB_SENTINEL" ]]; check "file-first: valid file -> security stub NOT invoked" $?
+
+rm -f "$CREDS_TEST_DIR/.credentials.json"
+rm -f "$SECURITY_STUB_SENTINEL"
+get_token
+assert_eq "no file (Darwin) -> keychain fallback token" "tok_fake_keychain" "$TOKEN"
+assert_eq "no file (Darwin) -> token_source=keychain" "keychain" "$TOKEN_SOURCE"
+[[ -f "$SECURITY_STUB_SENTINEL" ]]; check "no file (Darwin) -> security stub WAS invoked" $?
+
+rm -rf "$SECSTUB" "$CREDS_TEST_DIR"
+unset _CREDS_DIR SECURITY_STUB_SENTINEL
+
+# ─────────────────────────────────────────────────────────────
 # Area: render markers (shared_login_marker / unverifiable_marker)
 # ─────────────────────────────────────────────────────────────
 DIM=$'\033[2m'
