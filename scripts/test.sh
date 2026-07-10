@@ -765,7 +765,7 @@ url=""
 for arg in "$@"; do
   [[ "$arg" == http* ]] && url="$arg"
 done
-[[ "$url" == *"/api/oauth/profile"* ]] && printf '%s\n%s' '{"uuid":"comp-acct-uuid","email":"comp@example.com"}' "200"
+[[ "$url" == *"/api/oauth/profile"* ]] && printf '%s\n%s' '{"account":{"uuid":"comp-acct-uuid","email":"comp@example.com"}}' "200"
 EOF
 chmod +x "$COMPCURL/curl"
 
@@ -1103,7 +1103,7 @@ mkdir -p "$CAP_CONFIG_DIR"
 echo '{"oauthAccount":{"accountUuid":"profile-uuid-abc","profileFetchedAt":1783657301823}}' > "$CAP_CONFIG_DIR/.claude.json"
 
 export PROFILE_HTTP_CODE=200
-export PROFILE_RESPONSE_BODY='{"uuid":"profile-uuid-abc","email":"person@example.com"}'
+export PROFILE_RESPONSE_BODY='{"account":{"uuid":"profile-uuid-abc","email":"person@example.com"}}'
 cap_out=$(CLAUDE_CONFIG_DIR="$CAP_CONFIG_DIR" PATH="$CAPPATH" bash "$CAPTURE" 2>&1)
 cap_status=$?
 check "capture happy path: exits 0" $cap_status
@@ -1141,7 +1141,7 @@ echo '{"oauthAccount":{"accountUuid":"profile-uuid-abc","profileFetchedAt":17836
 rm -f "${RUNTIME_DIR}/.claude_cred_capture_vetoed_personal"
 
 export PROFILE_HTTP_CODE=200
-export PROFILE_RESPONSE_BODY='{"uuid":"other-uuid-xyz","email":"other@example.com"}'
+export PROFILE_RESPONSE_BODY='{"account":{"uuid":"other-uuid-xyz","email":"other@example.com"}}'
 cap_out3=$(CLAUDE_CONFIG_DIR="$CAP_CONFIG_DIR3" PATH="$CAPPATH" bash "$CAPTURE" 2>&1)
 cap_status=$?
 # Exit code 2, not a generic nonzero — part of the attempt_auto_capture
