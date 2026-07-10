@@ -304,6 +304,22 @@ resolve_capture_script() {
   fi
 }
 
+# Sentinel recording the profileFetchedAt VALUE last attempted, regardless
+# of outcome (vetoed, missing-script skip, or an actual capture attempt).
+# Without this, an unchanged login that keeps getting vetoed (timing
+# window) or skipped (missing script) would re-run read_keychain_mdat_epoch
+# plus the identity probe in capture-profile-session.sh on EVERY single
+# render until the next real login — a probe-storm. A new login (new
+# profileFetchedAt value) doesn't match the sentinel, so it naturally
+# re-arms.
+auto_capture_sentinel() {
+  printf '/tmp/.claude_cred_capture_attempted_%s' "$ACCOUNT_ID"
+}
+
+record_capture_attempt() {
+  printf '%s' "$1" > "$(auto_capture_sentinel)" 2>/dev/null
+}
+
 # Auto-capture ("/login is all I do"): fires when this profile's
 # .claude.json .oauthAccount.profileFetchedAt VALUE-CHANGES relative to
 # the credentials file's claudeline.captured_login_at (or the file is
@@ -339,12 +355,21 @@ maybe_auto_capture() {
   [[ -f "$creds_file" ]] && captured_login_at=$(jq -r '.claudeline.captured_login_at // empty' "$creds_file" 2>/dev/null)
   [[ "$profile_fetched_at" == "$captured_login_at" ]] && return 0
 
+  # Probe-storm guard: this exact login has already been attempted
+  # (whatever the outcome) — skip the ENTIRE flow below, including the
+  # keychain mdat read and the identity probe, without even taking the
+  # lock.
+  local attempted_value
+  [[ -f "$(auto_capture_sentinel)" ]] && attempted_value=$(cat "$(auto_capture_sentinel)" 2>/dev/null)
+  [[ "$profile_fetched_at" == "$attempted_value" ]] && return 0
+
   acquire_cred_lock || return 0
 
   local window="${CLAUDELINE_CAPTURE_WINDOW_SECS:-30}"
   local mdat_epoch profile_fetched_sec delta
   mdat_epoch=$(read_keychain_mdat_epoch)
   if [[ -z "$mdat_epoch" ]]; then
+    record_capture_attempt "$profile_fetched_at"
     release_cred_lock
     return 0
   fi
@@ -361,6 +386,7 @@ maybe_auto_capture() {
     printf '%s auto_capture_veto reason=timing_window delta=%ss window=%ss profileFetchedAt=%s mdat=%s uuid=%s email=%s\n' \
       "$(date +%s)" "$delta" "$window" "$profile_fetched_at" "$mdat_epoch" "$cap_uuid" "$cap_email" > "$artifact"
     echo "${DIM}Usage: auto-capture vetoed for ${cap_email} (${cap_uuid}) — keychain/login timing outside ${window}s window (delta=${delta}s)${RESET}" >&2
+    record_capture_attempt "$profile_fetched_at"
     release_cred_lock
     return 0
   fi
@@ -369,12 +395,14 @@ maybe_auto_capture() {
   capture_script=$(resolve_capture_script)
   if [[ ! -f "$capture_script" ]]; then
     echo "${DIM}Usage: auto-capture skipped for ${cap_email} (${cap_uuid}) — capture script not found at ${capture_script}${RESET}" >&2
+    record_capture_attempt "$profile_fetched_at"
     release_cred_lock
     return 0
   fi
 
   echo "${DIM}Usage: auto-capturing session for ${cap_email} (${cap_uuid})${RESET}" >&2
-  CLAUDE_CONFIG_DIR="$_CREDS_DIR" bash "$capture_script" >/dev/null 2>&1
+  CLAUDELINE_PROFILE_FETCHED_AT="$profile_fetched_at" CLAUDE_CONFIG_DIR="$_CREDS_DIR" bash "$capture_script" >/dev/null 2>&1
+  record_capture_attempt "$profile_fetched_at"
 
   release_cred_lock
   return 0

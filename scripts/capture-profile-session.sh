@@ -69,7 +69,15 @@ if [[ -z "$uuid" ]]; then
   exit 1
 fi
 
-profile_fetched_at=$(jq -r '.oauthAccount.profileFetchedAt // empty' "$CONFIG_DIR/.claude.json" 2>/dev/null)
+# Prefer the value the hook's auto-capture trigger already read
+# (CLAUDELINE_PROFILE_FETCHED_AT) over re-reading .claude.json here — that
+# removes a TOCTOU window between the trigger's read and this script's own
+# stamp read, where .claude.json could change between the two. Manual runs
+# (no env var set) still read the file directly.
+profile_fetched_at="${CLAUDELINE_PROFILE_FETCHED_AT:-}"
+if [[ -z "$profile_fetched_at" ]]; then
+  profile_fetched_at=$(jq -r '.oauthAccount.profileFetchedAt // empty' "$CONFIG_DIR/.claude.json" 2>/dev/null)
+fi
 profile_email=$(jq -r '.oauthAccount.emailAddress // .oauthAccount.email // "unknown"' "$CONFIG_DIR/.claude.json" 2>/dev/null)
 
 # Same lock refresh_token_grant/maybe_auto_capture hold in the hook, so a

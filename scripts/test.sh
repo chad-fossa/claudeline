@@ -359,9 +359,13 @@ check "fetch_usage uses --max-time 5" $?
 MAC_SRC=$(extract_func "$HOOK" maybe_auto_capture)
 RKM_SRC=$(extract_func "$HOOK" read_keychain_mdat_epoch)
 RCS_SRC=$(extract_func "$HOOK" resolve_capture_script)
+ACS_SRC=$(extract_func "$HOOK" auto_capture_sentinel)
+RCA_SRC=$(extract_func "$HOOK" record_capture_attempt)
 [[ -n "$MAC_SRC" ]]; check "maybe_auto_capture is defined" $?
 eval "$RKM_SRC"
 eval "$RCS_SRC"
+eval "$ACS_SRC"
+eval "$RCA_SRC"
 eval "$MAC_SRC"
 
 epoch_to_mdat_ts() {
@@ -430,20 +434,71 @@ rm -f "$AUTO_CAPTURE_SENTINEL"
 maybe_auto_capture
 [[ -f "$AUTO_CAPTURE_SENTINEL" ]]; check "trigger + mdat+5s (in window): capture invoked" $?
 
-# mdat 90s AFTER stamp -> veto artifact, no capture
+# mdat 90s AFTER stamp -> veto artifact, no capture. Distinct
+# profileFetchedAt (BASE_MS+1000, a "new login") so the probe-storm
+# sentinel from the prior scenario's successful invoke doesn't
+# short-circuit this one — each of these scenarios is its own
+# independent login attempt.
 export MDAT_TS=$(epoch_to_mdat_ts $((BASE_EPOCH + 90)))
+echo "{\"oauthAccount\":{\"accountUuid\":\"acct-1\",\"profileFetchedAt\":$((BASE_MS + 1000))}}" > "$_CREDS_DIR/.claude.json"
 rm -f "$AUTO_CAPTURE_SENTINEL" "/tmp/.claude_cred_capture_vetoed_clltest"
 maybe_auto_capture
 [[ ! -f "$AUTO_CAPTURE_SENTINEL" ]]; check "mdat +90s (outside window): capture NOT invoked" $?
 [[ -f "/tmp/.claude_cred_capture_vetoed_clltest" ]]; check "mdat +90s (outside window): veto artifact created" $?
 
 # mdat 40s BEFORE stamp -> veto too (two-sidedness — the review's fix for
-# the one-sided-window defect)
+# the one-sided-window defect). Another new profileFetchedAt.
 export MDAT_TS=$(epoch_to_mdat_ts $((BASE_EPOCH - 40)))
+echo "{\"oauthAccount\":{\"accountUuid\":\"acct-1\",\"profileFetchedAt\":$((BASE_MS + 2000))}}" > "$_CREDS_DIR/.claude.json"
 rm -f "$AUTO_CAPTURE_SENTINEL" "/tmp/.claude_cred_capture_vetoed_clltest"
 maybe_auto_capture
 [[ ! -f "$AUTO_CAPTURE_SENTINEL" ]]; check "mdat -40s (outside window, two-sided): capture NOT invoked" $?
 [[ -f "/tmp/.claude_cred_capture_vetoed_clltest" ]]; check "mdat -40s (outside window, two-sided): veto artifact created" $?
+
+# Probe-storm guard: a SECOND invocation with the SAME (unchanged)
+# profileFetchedAt as the immediately-preceding veto must perform NO
+# security call at all (not even read_keychain_mdat_epoch) — the sentinel
+# already recorded this exact login as attempted. Assert via the security
+# stub's own call-count sentinel rather than re-checking the veto artifact
+# (which the first call already created and this one must NOT touch).
+SECURITY_CALL_COUNT="$AC_DIR/security_call_count"
+: > "$SECURITY_CALL_COUNT"
+cat > "$AUTOSEC/security" <<'EOF'
+#!/bin/bash
+echo -n x >> "$SECURITY_CALL_COUNT"
+for arg in "$@"; do
+  [[ "$arg" == "-w" ]] && { echo '{"claudeAiOauth":{"accessToken":"tok_fake_should_not_be_read"}}'; exit 0; }
+done
+printf 'keychain: "/tmp/fake.keychain-db"\n'
+printf 'version: 512\n'
+printf 'class: "genp"\n'
+printf 'attributes:\n'
+printf '    0x00000007 <blob>="Claude Code-credentials"\n'
+printf '    "acct"<blob>="fakeacct"\n'
+printf '    "cdat"<timedate>=0x00000000000000000000000000000000  "%s' "$MDAT_TS"
+printf '\0"\n'
+printf '    "mdat"<timedate>=0x00000000000000000000000000000000  "%s' "$MDAT_TS"
+printf '\0"\n'
+EOF
+chmod +x "$AUTOSEC/security"
+export SECURITY_CALL_COUNT
+before_calls=$(cat "$SECURITY_CALL_COUNT")
+rm -f "$AUTO_CAPTURE_SENTINEL" "/tmp/.claude_cred_capture_vetoed_clltest"
+maybe_auto_capture
+after_calls=$(cat "$SECURITY_CALL_COUNT")
+assert_eq "probe-storm guard: unchanged profileFetchedAt after a veto makes NO security call" "$before_calls" "$after_calls"
+[[ ! -f "/tmp/.claude_cred_capture_vetoed_clltest" ]]; check "probe-storm guard: no new veto artifact (flow never re-entered)" $?
+
+# A genuinely new login (new profileFetchedAt) re-arms — security IS
+# called again.
+export MDAT_TS=$(epoch_to_mdat_ts $((BASE_EPOCH + 90)))
+echo "{\"oauthAccount\":{\"accountUuid\":\"acct-1\",\"profileFetchedAt\":$((BASE_MS + 5000))}}" > "$_CREDS_DIR/.claude.json"
+before_calls=$(cat "$SECURITY_CALL_COUNT")
+rm -f "/tmp/.claude_cred_capture_vetoed_clltest"
+maybe_auto_capture
+after_calls=$(cat "$SECURITY_CALL_COUNT")
+[[ "$after_calls" != "$before_calls" ]]; check "probe-storm guard: new profileFetchedAt re-arms (security called again)" $?
+unset SECURITY_CALL_COUNT
 
 # profileFetchedAt absent -> no auto-capture (unchanged keychain+? behavior)
 echo '{"oauthAccount":{"accountUuid":"acct-1"}}' > "$_CREDS_DIR/.claude.json"
@@ -461,8 +516,10 @@ maybe_auto_capture
 [[ ! -f "$AUTO_CAPTURE_SENTINEL" ]]; check "ACCOUNT_ASSUMED=1: capture NOT invoked" $?
 ACCOUNT_ASSUMED=0
 
-# capture script missing -> loud skip, never fatal (render must proceed)
+# capture script missing -> loud skip, never fatal (render must proceed).
+# New profileFetchedAt (BASE_MS+9000) — a value never attempted before.
 rm -f "$_CREDS_DIR/scripts/capture-profile-session.sh"
+echo "{\"oauthAccount\":{\"accountUuid\":\"acct-1\",\"profileFetchedAt\":$((BASE_MS + 9000))}}" > "$_CREDS_DIR/.claude.json"
 rm -f "$_CREDS_DIR/.credentials.json" "$AUTO_CAPTURE_SENTINEL"
 maybe_auto_capture 2>/tmp/.cll_ac_stderr
 result=$?
@@ -470,9 +527,28 @@ assert_eq "capture script missing: maybe_auto_capture still returns 0 (non-fatal
 [[ -s /tmp/.cll_ac_stderr ]]; check "capture script missing: loud stderr" $?
 rm -f /tmp/.cll_ac_stderr
 
+# Missing-capture-script skip also records the attempt (probe-storm guard
+# applies to this outcome too, not just the timing veto).
+echo "{\"oauthAccount\":{\"accountUuid\":\"acct-1\",\"profileFetchedAt\":$((BASE_MS + 9000))}}" > "$_CREDS_DIR/.claude.json"
+SECURITY_CALL_COUNT="$AC_DIR/security_call_count2"
+: > "$SECURITY_CALL_COUNT"
+export SECURITY_CALL_COUNT
+cat > "$AUTOSEC/security" <<'EOF'
+#!/bin/bash
+echo -n x >> "$SECURITY_CALL_COUNT"
+printf 'keychain: "/tmp/fake.keychain-db"\n'
+printf '    "mdat"<timedate>=0x00000000000000000000000000000000  "%s\0"\n' "$MDAT_TS"
+EOF
+chmod +x "$AUTOSEC/security"
+before_calls=$(cat "$SECURITY_CALL_COUNT")
+maybe_auto_capture 2>/dev/null
+after_calls=$(cat "$SECURITY_CALL_COUNT")
+assert_eq "missing-capture-script skip: recorded attempt suppresses a repeat security call" "$before_calls" "$after_calls"
+unset SECURITY_CALL_COUNT
+
 unset AUTO_CAPTURE_SENTINEL MDAT_TS
 rm -rf "$AC_DIR" "$AUTOSEC"
-rm -f "/tmp/.claude_cred_capture_vetoed_clltest"
+rm -f "/tmp/.claude_cred_capture_vetoed_clltest" "/tmp/.claude_cred_capture_attempted_clltest"
 rmdir "/tmp/.claude_cred_lock_clltest" 2>/dev/null
 unset _CREDS_DIR ACCOUNT_ID ACCOUNT_ASSUMED
 
@@ -600,6 +676,17 @@ cap_perms=$(stat -f%Lp "$CAP_CONFIG_DIR/.credentials.json" 2>/dev/null || stat -
 assert_eq "capture happy path: perms 600" "600" "$cap_perms"
 echo "$cap_out" | grep -q "tok_fake_capture"
 [[ $? -ne 0 ]]; check "capture happy path: no token value on stdout" $?
+
+# CLAUDELINE_PROFILE_FETCHED_AT env var (the hook's already-read value)
+# wins over re-reading .claude.json — removes the TOCTOU between the
+# trigger's read and this script's own stamp read. .claude.json here
+# deliberately carries a DIFFERENT value than the env var so a pass
+# proves the env var, not the file, won.
+CAP_CONFIG_DIR_ENV="$CAP_DIR/claude-personal-envvar"
+mkdir -p "$CAP_CONFIG_DIR_ENV"
+echo '{"oauthAccount":{"accountUuid":"profile-uuid-abc","profileFetchedAt":1111111111111}}' > "$CAP_CONFIG_DIR_ENV/.claude.json"
+CLAUDELINE_PROFILE_FETCHED_AT=2222222222222 CLAUDE_CONFIG_DIR="$CAP_CONFIG_DIR_ENV" PATH="$CAPPATH" bash "$CAPTURE" >/dev/null 2>&1
+assert_eq "capture: CLAUDELINE_PROFILE_FETCHED_AT env var wins over .claude.json" "2222222222222" "$(jq -r '.claudeline.captured_login_at' "$CAP_CONFIG_DIR_ENV/.credentials.json" 2>/dev/null)"
 
 # Probe 200 + uuid MISMATCH -> abort, no write, loud stderr with both
 # uuids + emails (never tokens), veto artifact.
