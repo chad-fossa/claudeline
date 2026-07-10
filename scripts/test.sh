@@ -644,6 +644,180 @@ rmdir "${RUNTIME_DIR}/.claude_cred_lock_clltest" 2>/dev/null
 unset _CREDS_DIR ACCOUNT_ID ACCOUNT_ASSUMED
 
 # ─────────────────────────────────────────────────────────────
+# Area: maybe_auto_capture composed with the REAL
+# scripts/capture-profile-session.sh (not a stub). The block above stubs
+# the capture script with a 2-line fake that never calls
+# acquire_cred_lock, so it can never exercise the parent (hook, holds the
+# lock across the whole invocation) / child (script, independently
+# acquires the SAME lock) nesting a real run hits. This composition test
+# runs the genuine script as the actual subprocess maybe_auto_capture
+# shells out to — the exact case that shipped broken (self-deadlock: the
+# child sees its own parent's lock, exits 1, and the failure was silent
+# because stderr was swallowed and the sentinel was recorded regardless of
+# outcome). See .claude/agent-memory/claudeline-core/v060_render_refresh_cycle.md.
+# ─────────────────────────────────────────────────────────────
+# _CREDS_DIR's basename must contain "claude-personal": the real capture
+# script is invoked as an actual subprocess (CLAUDE_CONFIG_DIR=$_CREDS_DIR)
+# and runs its OWN detect_account() from that env var — it can't inherit
+# this test's ACCOUNT_ID variable. Both sides have to independently derive
+# the SAME account id (via the real detect_account() convention) for the
+# two lock acquisitions to actually collide the way a real run does; an
+# arbitrary test-only id (as the stub-based block above uses) would give
+# parent and child different lock dirs and silently not exercise the bug.
+COMP_PARENT=$(mktemp -d)
+COMP_DIR="$COMP_PARENT/claude-personal"
+mkdir -p "$COMP_DIR/scripts"
+_CREDS_DIR="$COMP_DIR"
+cp "$CAPTURE" "$_CREDS_DIR/scripts/capture-profile-session.sh"
+chmod +x "$_CREDS_DIR/scripts/capture-profile-session.sh"
+ACCOUNT_ID="personal"
+ACCOUNT_ASSUMED=0
+OSTYPE="darwin24"
+COMP_EPOCH=$(date +%s)
+COMP_MS=$((COMP_EPOCH * 1000))
+
+# Stubs security (both the hook's own metadata-only mdat read AND the real
+# capture script's -w secret fetch) and curl (the real script's identity
+# probe against /api/oauth/profile) so the composed real script can run
+# end to end without touching the network or the real Keychain.
+COMPSEC=$(mktemp -d)
+cat > "$COMPSEC/security" <<'EOF'
+#!/bin/bash
+for arg in "$@"; do
+  [[ "$arg" == "-w" ]] && { echo '{"claudeAiOauth":{"accessToken":"tok_fake_comp","refreshToken":"rtok_fake_comp","expiresAt":9999999999999,"email":"comp@example.com"}}'; exit 0; }
+done
+printf 'keychain: "/tmp/fake.keychain-db"\n'
+printf '    "mdat"<timedate>=0x00000000000000000000000000000000  "%s\0"\n' "$MDAT_TS"
+EOF
+chmod +x "$COMPSEC/security"
+export MDAT_TS=$(epoch_to_mdat_ts $((COMP_EPOCH + 2)))
+
+COMPCURL=$(mktemp -d)
+cat > "$COMPCURL/curl" <<'EOF'
+#!/bin/bash
+url=""
+for arg in "$@"; do
+  [[ "$arg" == http* ]] && url="$arg"
+done
+[[ "$url" == *"/api/oauth/profile"* ]] && printf '%s\n%s' '{"uuid":"comp-acct-uuid","email":"comp@example.com"}' "200"
+EOF
+chmod +x "$COMPCURL/curl"
+
+export PATH="$COMPCURL:$COMPSEC:$PATH"
+
+echo "{\"oauthAccount\":{\"accountUuid\":\"comp-acct-uuid\",\"profileFetchedAt\":$COMP_MS}}" > "$_CREDS_DIR/.claude.json"
+rm -f "$_CREDS_DIR/.credentials.json"
+rmdir "${RUNTIME_DIR}/.claude_cred_lock_personal" 2>/dev/null
+rm -f "${RUNTIME_DIR}/.claude_cred_capture_vetoed_personal" "${RUNTIME_DIR}/.claude_cred_capture_attempted_personal"
+
+maybe_auto_capture
+
+[[ -f "$_CREDS_DIR/.credentials.json" ]]
+check "self-deadlock regression: maybe_auto_capture composed with the REAL capture script writes .credentials.json" $?
+assert_eq "self-deadlock regression: verified_account_uuid stamped (probe matched)" "comp-acct-uuid" "$(jq -r '.claudeline.verified_account_uuid // empty' "$_CREDS_DIR/.credentials.json" 2>/dev/null)"
+
+unset MDAT_TS
+rm -rf "$COMP_PARENT" "$COMPSEC" "$COMPCURL"
+rmdir "${RUNTIME_DIR}/.claude_cred_lock_personal" 2>/dev/null
+rm -f "${RUNTIME_DIR}/.claude_cred_capture_vetoed_personal" "${RUNTIME_DIR}/.claude_cred_capture_attempted_personal"
+unset _CREDS_DIR ACCOUNT_ID ACCOUNT_ASSUMED
+
+# ─────────────────────────────────────────────────────────────
+# Area: attempt_auto_capture exit-code contract (0=captured [tested
+# above], 2=vetoed -> sentinel recorded, no retry; 1=transient failure ->
+# NO sentinel, next render retries) and maybe_auto_capture's own
+# short-circuit when an UNRELATED process (not its own eventual child)
+# already holds the lock — tests-reviewer's surviving F3.
+# ─────────────────────────────────────────────────────────────
+EC_DIR=$(mktemp -d)
+_CREDS_DIR="$EC_DIR"
+mkdir -p "$_CREDS_DIR/scripts"
+ACCOUNT_ID="personal"
+ACCOUNT_ASSUMED=0
+OSTYPE="darwin24"
+EC_EPOCH=$(date +%s)
+EC_MS=$((EC_EPOCH * 1000))
+
+EC_SEC=$(mktemp -d)
+export MDAT_TS=$(epoch_to_mdat_ts $((EC_EPOCH + 2)))
+EC_SECURITY_CALLS="$EC_DIR/security_calls"
+: > "$EC_SECURITY_CALLS"
+export EC_SECURITY_CALLS
+cat > "$EC_SEC/security" <<'EOF'
+#!/bin/bash
+echo -n x >> "$EC_SECURITY_CALLS"
+printf 'keychain: "/tmp/fake.keychain-db"\n'
+printf '    "mdat"<timedate>=0x00000000000000000000000000000000  "%s\0"\n' "$MDAT_TS"
+EOF
+chmod +x "$EC_SEC/security"
+export PATH="$EC_SEC:$PATH"
+
+rmdir "${RUNTIME_DIR}/.claude_cred_lock_personal" 2>/dev/null
+rm -f "${RUNTIME_DIR}/.claude_cred_capture_vetoed_personal" "${RUNTIME_DIR}/.claude_cred_capture_attempted_personal"
+
+# --- exit 1 (transient, e.g. lock held elsewhere / unreadable Keychain
+# from the SCRIPT's own perspective) -> no sentinel, next render retries.
+cat > "$_CREDS_DIR/scripts/capture-profile-session.sh" <<EOF
+#!/bin/bash
+touch "$EC_DIR/invoked_transient"
+exit 1
+EOF
+chmod +x "$_CREDS_DIR/scripts/capture-profile-session.sh"
+echo "{\"oauthAccount\":{\"accountUuid\":\"acct-ec\",\"profileFetchedAt\":$EC_MS}}" > "$_CREDS_DIR/.claude.json"
+rm -f "$_CREDS_DIR/.credentials.json" "$EC_DIR/invoked_transient"
+
+maybe_auto_capture
+[[ -f "$EC_DIR/invoked_transient" ]]; check "exit 1 (transient failure): capture script WAS invoked" $?
+[[ ! -f "${RUNTIME_DIR}/.claude_cred_capture_attempted_personal" ]]; check "exit 1 (transient failure): no sentinel recorded" $?
+
+# Same profileFetchedAt, second render -> retried (no probe-storm block).
+rm -f "$EC_DIR/invoked_transient"
+maybe_auto_capture
+[[ -f "$EC_DIR/invoked_transient" ]]; check "exit 1 (transient failure): next render retries (script invoked again)" $?
+
+# --- exit 2 (vetoed, e.g. identity mismatch) -> sentinel recorded, no retry.
+cat > "$_CREDS_DIR/scripts/capture-profile-session.sh" <<EOF
+#!/bin/bash
+touch "$EC_DIR/invoked_vetoed"
+exit 2
+EOF
+chmod +x "$_CREDS_DIR/scripts/capture-profile-session.sh"
+EC_MS2=$((EC_MS + 1000))
+echo "{\"oauthAccount\":{\"accountUuid\":\"acct-ec\",\"profileFetchedAt\":$EC_MS2}}" > "$_CREDS_DIR/.claude.json"
+rm -f "${RUNTIME_DIR}/.claude_cred_capture_attempted_personal" "$EC_DIR/invoked_vetoed"
+
+maybe_auto_capture
+[[ -f "$EC_DIR/invoked_vetoed" ]]; check "exit 2 (vetoed): capture script WAS invoked" $?
+assert_eq "exit 2 (vetoed): sentinel recorded" "$EC_MS2" "$(cat "${RUNTIME_DIR}/.claude_cred_capture_attempted_personal" 2>/dev/null)"
+
+rm -f "$EC_DIR/invoked_vetoed"
+maybe_auto_capture
+[[ ! -f "$EC_DIR/invoked_vetoed" ]]; check "exit 2 (vetoed): same profileFetchedAt does NOT retry (probe-storm guard blocks it)" $?
+
+# --- F3: an UNRELATED process holds the lock (pre-created before
+# maybe_auto_capture is even called, simulating a concurrent refresh/
+# capture from another render) -> maybe_auto_capture must short-circuit
+# at its OWN acquire_cred_lock and never reach attempt_auto_capture at
+# all: no security call, no sentinel, no artifact. Benign silent skip.
+mkdir -p "${RUNTIME_DIR}/.claude_cred_lock_personal"
+rm -f "${RUNTIME_DIR}/.claude_cred_capture_attempted_personal" "${RUNTIME_DIR}/.claude_cred_capture_vetoed_personal"
+EC_MS3=$((EC_MS + 2000))
+echo "{\"oauthAccount\":{\"accountUuid\":\"acct-ec\",\"profileFetchedAt\":$EC_MS3}}" > "$_CREDS_DIR/.claude.json"
+before_calls=$(cat "$EC_SECURITY_CALLS")
+maybe_auto_capture
+after_calls=$(cat "$EC_SECURITY_CALLS")
+assert_eq "F3: unrelated process holds lock -> maybe_auto_capture never calls security (short-circuits at its own acquire)" "$before_calls" "$after_calls"
+[[ ! -f "${RUNTIME_DIR}/.claude_cred_capture_attempted_personal" ]]; check "F3: unrelated process holds lock -> no sentinel" $?
+[[ ! -f "${RUNTIME_DIR}/.claude_cred_capture_vetoed_personal" ]]; check "F3: unrelated process holds lock -> no veto artifact" $?
+rmdir "${RUNTIME_DIR}/.claude_cred_lock_personal" 2>/dev/null
+
+unset MDAT_TS EC_SECURITY_CALLS
+rm -rf "$EC_DIR" "$EC_SEC"
+rm -f "${RUNTIME_DIR}/.claude_cred_capture_vetoed_personal" "${RUNTIME_DIR}/.claude_cred_capture_attempted_personal"
+rmdir "${RUNTIME_DIR}/.claude_cred_lock_personal" 2>/dev/null
+unset _CREDS_DIR ACCOUNT_ID ACCOUNT_ASSUMED
+
+# ─────────────────────────────────────────────────────────────
 # Area: main() file-refresh-failed handling (artifact + cache merge,
 # no silent keychain fallback)
 # ─────────────────────────────────────────────────────────────
@@ -807,7 +981,10 @@ export PROFILE_HTTP_CODE=200
 export PROFILE_RESPONSE_BODY='{"uuid":"other-uuid-xyz","email":"other@example.com"}'
 cap_out3=$(CLAUDE_CONFIG_DIR="$CAP_CONFIG_DIR3" PATH="$CAPPATH" bash "$CAPTURE" 2>&1)
 cap_status=$?
-[[ "$cap_status" != "0" ]]; check "capture probe mismatch: exits 1" $?
+# Exit code 2, not a generic nonzero — part of the attempt_auto_capture
+# exit-code contract (0=captured, 2=vetoed [sentinel recorded, no
+# retry], 1=transient [no sentinel, retried]).
+assert_eq "capture probe mismatch: exits 2 (vetoed, distinct from transient-failure exit 1)" "2" "$cap_status"
 [[ ! -f "$CAP_CONFIG_DIR3/.credentials.json" ]]; check "capture probe mismatch: no file written" $?
 [[ -f "${RUNTIME_DIR}/.claude_cred_capture_vetoed_personal" ]]; check "capture probe mismatch: veto artifact created" $?
 grep -q "reason=identity_mismatch" "${RUNTIME_DIR}/.claude_cred_capture_vetoed_personal"
@@ -877,7 +1054,7 @@ echo '{"oauthAccount":{"accountUuid":"profile-uuid-abc","profileFetchedAt":17836
 mkdir -p "${RUNTIME_DIR}/.claude_cred_lock_personal"
 cap_out6=$(CLAUDE_CONFIG_DIR="$CAP_CONFIG_DIR6" PATH="$CAPPATH" bash "$CAPTURE" 2>&1)
 cap_status=$?
-[[ "$cap_status" != "0" ]]; check "manual capture blocked while lock held: exits 1" $?
+assert_eq "manual capture blocked while lock held: exits 1 (transient, not vetoed)" "1" "$cap_status"
 [[ ! -f "$CAP_CONFIG_DIR6/.credentials.json" ]]; check "manual capture blocked while lock held: no file written" $?
 [[ -n "$cap_out6" ]]; check "manual capture blocked while lock held: loud message" $?
 rmdir "${RUNTIME_DIR}/.claude_cred_lock_personal" 2>/dev/null

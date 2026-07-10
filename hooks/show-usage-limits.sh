@@ -466,10 +466,17 @@ maybe_auto_capture() {
 
 # Runs the mdat-corroboration veto check and, if it passes, invokes the
 # capture script — assumes the cred lock is already held by the caller
-# (maybe_auto_capture). Every path (mdat-read failure, veto, missing
-# script, or an actual invoke) calls record_capture_attempt so a repeat
-# render for this same login skips entirely via maybe_auto_capture's
-# probe-storm guard above.
+# (maybe_auto_capture). Every path EXCEPT the actual invoke's exit code 1
+# (mdat-read failure, veto, missing script, an invoke that exits 0 or 2)
+# calls record_capture_attempt so a repeat render for this same login
+# skips entirely via maybe_auto_capture's probe-storm guard above. An
+# invoke that exits 1 (transient: e.g. an unreadable Keychain entry) does
+# NOT record the attempt, so the next render retries rather than being
+# stuck on a transient failure until a brand new login.
+# Exit-code contract for capture-profile-session.sh (see that script):
+# 0 = captured (verified or unverified) ; 2 = vetoed (identity mismatch —
+# sentinel yes, prevents a probe-storm re-verifying the same bad session)
+# ; 1 = transient failure (lock held, unreadable Keychain — no sentinel).
 attempt_auto_capture() {
   local profile_fetched_at=$1 claude_json=$2
   local window="${CLAUDELINE_CAPTURE_WINDOW_SECS:-30}"
@@ -505,8 +512,19 @@ attempt_auto_capture() {
   fi
 
   echo "${DIM}Usage: auto-capturing session for ${cap_email} (${cap_uuid})${RESET}" >&2
-  CLAUDELINE_PROFILE_FETCHED_AT="$profile_fetched_at" CLAUDE_CONFIG_DIR="$_CREDS_DIR" bash "$capture_script" >/dev/null 2>&1
-  record_capture_attempt "$profile_fetched_at"
+  # CLAUDELINE_CRED_LOCK_HELD=1 tells the child we already hold the cred
+  # lock (acquired above by our own caller, maybe_auto_capture) — it skips
+  # its own acquire/release rather than colliding with ours (the
+  # self-deadlock this composition test guards: without the hand-off, the
+  # child always finds the lock held by its own parent and exits 1 on
+  # every real invocation). Stdout is still suppressed (nothing on it is
+  # meant for the render); stderr is NOT redirected — it flows through to
+  # this hook's own stderr so a failure is no longer invisible.
+  local capture_exit
+  CLAUDELINE_PROFILE_FETCHED_AT="$profile_fetched_at" CLAUDE_CONFIG_DIR="$_CREDS_DIR" \
+    CLAUDELINE_CRED_LOCK_HELD=1 bash "$capture_script" >/dev/null
+  capture_exit=$?
+  [[ "$capture_exit" == "0" || "$capture_exit" == "2" ]] && record_capture_attempt "$profile_fetched_at"
 }
 
 # Fetch usage limits from API

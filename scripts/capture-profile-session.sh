@@ -64,6 +64,26 @@ release_cred_lock() {
   _CRED_LOCK_PREV_TRAP=""
 }
 
+# hooks/show-usage-limits.sh's maybe_auto_capture already holds this exact
+# lock for the whole duration it shells out to this script — without a
+# hand-off, this script's own acquire_cred_lock always finds that lock
+# held by its own parent and exits 1 on every real auto-capture
+# invocation (the self-deadlock that shipped in v0.6.0's fix pass; see
+# .claude/agent-memory/claudeline-core/v060_render_refresh_cycle.md).
+# CLAUDELINE_CRED_LOCK_HELD=1 (set only by that caller) skips this
+# script's own acquire/release — the parent's held lock still serializes
+# the whole section. A manual/standalone run (var unset) acquires and
+# releases exactly as before.
+acquire_cred_lock_unless_parent_holds() {
+  [[ "${CLAUDELINE_CRED_LOCK_HELD:-}" == "1" ]] && return 0
+  acquire_cred_lock
+}
+
+release_cred_lock_unless_parent_holds() {
+  [[ "${CLAUDELINE_CRED_LOCK_HELD:-}" == "1" ]] && return 0
+  release_cred_lock
+}
+
 if [[ "$ACCOUNT_ASSUMED" == "1" ]]; then
   echo "set CLAUDE_CONFIG_DIR explicitly or run from the profile's session" >&2
   exit 1
@@ -91,8 +111,10 @@ profile_email=$(jq -r '.oauthAccount.emailAddress // .oauthAccount.email // "unk
 # Same lock refresh_token_grant/maybe_auto_capture hold in the hook, so a
 # manual capture can't race an in-flight refresh. A held lock means one of
 # those is already touching this account's credentials file — skip loudly
-# rather than wait or corrupt the write.
-if ! acquire_cred_lock; then
+# rather than wait or corrupt the write. (Auto-capture's own invocation
+# sets CLAUDELINE_CRED_LOCK_HELD=1 and skips this acquisition entirely —
+# see acquire_cred_lock_unless_parent_holds above.)
+if ! acquire_cred_lock_unless_parent_holds; then
   echo "capture skipped: credential lock held by an in-flight refresh/capture — try again shortly" >&2
   exit 1
 fi
@@ -100,14 +122,14 @@ fi
 creds=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null)
 if [[ -z "$creds" ]]; then
   echo "no Claude Code-credentials entry in Keychain" >&2
-  release_cred_lock
+  release_cred_lock_unless_parent_holds
   exit 1
 fi
 
 oauth_blob=$(echo "$creds" | jq -c '.claudeAiOauth' 2>/dev/null)
 if [[ -z "$oauth_blob" || "$oauth_blob" == "null" ]]; then
   echo "failed to parse claudeAiOauth from Keychain entry" >&2
-  release_cred_lock
+  release_cred_lock_unless_parent_holds
   exit 1
 fi
 
@@ -162,13 +184,19 @@ verify_capture_identity() {
 access_token=$(echo "$oauth_blob" | jq -r '.accessToken // empty')
 verify_capture_identity "$access_token" "$uuid"
 
+# Exit 2 (distinct from the generic exit-1 failures elsewhere in this
+# script) is part of the exit-code contract hooks/show-usage-limits.sh's
+# attempt_auto_capture relies on: 0=captured, 2=vetoed (this branch — the
+# per-login sentinel IS recorded, since re-probing the same bad session
+# on every render would be a probe-storm, not a useful retry), 1=transient
+# (lock held, unreadable Keychain — no sentinel, next render retries).
 if [[ "$VERIFY_STATUS" == "mismatch" ]]; then
   artifact="${RUNTIME_DIR}/.claude_cred_capture_vetoed_${ACCOUNT_ID}"
   printf '%s reason=identity_mismatch profile_uuid=%s probe_uuid=%s profile_email=%s probe_email=%s\n' \
     "$(date +%s)" "$uuid" "$PROBE_UUID" "$profile_email" "$PROBE_EMAIL" > "$artifact"
   echo "capture VETOED: keychain session belongs to a different account than this profile (profile uuid=${uuid} email=${profile_email}; keychain probe uuid=${PROBE_UUID} email=${PROBE_EMAIL})" >&2
-  release_cred_lock
-  exit 1
+  release_cred_lock_unless_parent_holds
+  exit 2
 fi
 
 captured_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -202,7 +230,7 @@ fi
 
 chmod 600 "$tmp_file"
 mv "$tmp_file" "$dest_file"
-release_cred_lock
+release_cred_lock_unless_parent_holds
 
 email=$(echo "$oauth_blob" | jq -r '.email // "unknown"')
 expiry=$(echo "$oauth_blob" | jq -r '.expiresAt // "unknown"')
