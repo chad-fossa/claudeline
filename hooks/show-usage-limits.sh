@@ -81,6 +81,15 @@ get_token() {
         return 0
       fi
 
+      # lock_held means a sibling render is already refreshing this same
+      # account — that sibling's result stands, so this is a benign silent
+      # skip, never a failure: no file-refresh-failed token_source (which
+      # would trip handle_refresh_failure's artifact/cache-mutation/`!`).
+      if [[ "$REFRESH_FAIL_REASON" == "lock_held" ]]; then
+        TOKEN_SOURCE="lock_held"
+        return 1
+      fi
+
       TOKEN_SOURCE="file-refresh-failed"
       return 1
     fi
@@ -103,12 +112,57 @@ get_token() {
   fi
 }
 
+# Single source for the cred lock path — used by refresh_token_grant AND
+# maybe_auto_capture below. scripts/capture-profile-session.sh inlines the
+# same three lock functions verbatim (standalone script, can't source this
+# file); scripts/test.sh asserts the two copies stay byte-identical.
+cred_lock_dir() {
+  printf '/tmp/.claude_cred_lock_%s' "$ACCOUNT_ID"
+}
+
+# Acquires the cred lock, reclaiming a stale lock dir first (age > 120s —
+# mirrors this repo's other age-out locks: statusline-command.sh's
+# usage-refresh lock (30s, maybe_refresh_usage_cache) and PR-fetch lock
+# (10s, get_pr_number)). Arms an EXIT trap so a TERM/INT/internal-error
+# death still releases the lock; a true SIGKILL bypasses all traps, so the
+# age-based reap above — not this trap — is the real backstop for a hard
+# kill. Saves/restores whatever EXIT trap the caller already had (rather
+# than a bare `trap - EXIT`) so this doesn't clobber a caller's own
+# cleanup trap — verified this matters: a naive `trap - EXIT` silently
+# erased a caller's pre-existing trap in testing. Callers release via
+# release_cred_lock at their own normal exit points.
+acquire_cred_lock() {
+  local lock_dir
+  lock_dir=$(cred_lock_dir)
+
+  if [[ -d "$lock_dir" ]]; then
+    local now mtime age
+    now=$(date +%s)
+    mtime=$(stat -f%m "$lock_dir" 2>/dev/null || stat -c%Y "$lock_dir" 2>/dev/null || echo "$now")
+    age=$((now - mtime))
+    ((age > 120)) && rmdir "$lock_dir" 2>/dev/null
+  fi
+
+  mkdir "$lock_dir" 2>/dev/null || return 1
+  _CRED_LOCK_PREV_TRAP=$(trap -p EXIT)
+  trap 'rmdir "'"$lock_dir"'" 2>/dev/null' EXIT
+  return 0
+}
+
+release_cred_lock() {
+  rmdir "$(cred_lock_dir)" 2>/dev/null
+  if [[ -n "$_CRED_LOCK_PREV_TRAP" ]]; then
+    eval "$_CRED_LOCK_PREV_TRAP"
+  else
+    trap - EXIT
+  fi
+  _CRED_LOCK_PREV_TRAP=""
+}
+
 # Refresh the file-based OAuth token by POSTing the stored refresh_token
 # to Anthropic's OAuth endpoint. Refuses on ACCOUNT_ASSUMED (no writes on
-# a guessed identity) and when another refresh is already in flight
-# (mkdir-based lock — wraps the whole read/POST/write critical section;
-# mkdir over statusline's touch+age guard because this section WRITES
-# credentials and needs true mutual exclusion, not a stampede guard).
+# a guessed identity) and when another refresh is already in flight (see
+# acquire_cred_lock — wraps the whole read/POST/write critical section).
 # Sets REFRESH_FAIL_REASON on failure. Never falls back to Keychain.
 refresh_token_grant() {
   REFRESH_FAIL_REASON=""
@@ -119,8 +173,7 @@ refresh_token_grant() {
     return 1
   fi
 
-  local lock_dir="/tmp/.claude_cred_lock_${ACCOUNT_ID}"
-  if ! mkdir "$lock_dir" 2>/dev/null; then
+  if ! acquire_cred_lock; then
     REFRESH_FAIL_REASON="lock_held"
     return 1
   fi
@@ -132,7 +185,7 @@ refresh_token_grant() {
 
   if [[ -z "$refresh_token" ]]; then
     REFRESH_FAIL_REASON="no_refresh_token"
-    rmdir "$lock_dir" 2>/dev/null
+    release_cred_lock
     return 1
   fi
 
@@ -151,7 +204,7 @@ refresh_token_grant() {
 
   if [[ "$http_code" != "200" ]] || ! echo "$payload" | jq -e . >/dev/null 2>&1; then
     REFRESH_FAIL_REASON="http_${http_code:-timeout}"
-    rmdir "$lock_dir" 2>/dev/null
+    release_cred_lock
     return 1
   fi
 
@@ -162,7 +215,7 @@ refresh_token_grant() {
 
   if [[ -z "$access_token" || -z "$expires_in" ]]; then
     REFRESH_FAIL_REASON="parse_failure"
-    rmdir "$lock_dir" 2>/dev/null
+    release_cred_lock
     return 1
   fi
 
@@ -177,7 +230,7 @@ refresh_token_grant() {
   chmod 600 "$tmp_file"
   mv "$tmp_file" "$creds_file"
 
-  rmdir "$lock_dir" 2>/dev/null
+  release_cred_lock
   return 0
 }
 
@@ -254,14 +307,13 @@ maybe_auto_capture() {
   [[ -f "$creds_file" ]] && captured_login_at=$(jq -r '.claudeline.captured_login_at // empty' "$creds_file" 2>/dev/null)
   [[ "$profile_fetched_at" == "$captured_login_at" ]] && return 0
 
-  local lock_dir="/tmp/.claude_cred_lock_${ACCOUNT_ID}"
-  mkdir "$lock_dir" 2>/dev/null || return 0
+  acquire_cred_lock || return 0
 
   local window="${CLAUDELINE_CAPTURE_WINDOW_SECS:-30}"
   local mdat_epoch profile_fetched_sec delta
   mdat_epoch=$(read_keychain_mdat_epoch)
   if [[ -z "$mdat_epoch" ]]; then
-    rmdir "$lock_dir" 2>/dev/null
+    release_cred_lock
     return 0
   fi
   profile_fetched_sec=$((profile_fetched_at / 1000))
@@ -274,10 +326,10 @@ maybe_auto_capture() {
 
   if ((delta > window)); then
     local artifact="/tmp/.claude_cred_capture_vetoed_${ACCOUNT_ID}"
-    printf '%s auto_capture_veto delta=%ss window=%ss profileFetchedAt=%s mdat=%s uuid=%s email=%s\n' \
+    printf '%s auto_capture_veto reason=timing_window delta=%ss window=%ss profileFetchedAt=%s mdat=%s uuid=%s email=%s\n' \
       "$(date +%s)" "$delta" "$window" "$profile_fetched_at" "$mdat_epoch" "$cap_uuid" "$cap_email" > "$artifact"
     echo "${DIM}Usage: auto-capture vetoed for ${cap_email} (${cap_uuid}) — keychain/login timing outside ${window}s window (delta=${delta}s)${RESET}" >&2
-    rmdir "$lock_dir" 2>/dev/null
+    release_cred_lock
     return 0
   fi
 
@@ -285,14 +337,14 @@ maybe_auto_capture() {
   capture_script=$(resolve_capture_script)
   if [[ ! -f "$capture_script" ]]; then
     echo "${DIM}Usage: auto-capture skipped for ${cap_email} (${cap_uuid}) — capture script not found at ${capture_script}${RESET}" >&2
-    rmdir "$lock_dir" 2>/dev/null
+    release_cred_lock
     return 0
   fi
 
   echo "${DIM}Usage: auto-capturing session for ${cap_email} (${cap_uuid})${RESET}" >&2
   CLAUDE_CONFIG_DIR="$_CREDS_DIR" bash "$capture_script" >/dev/null 2>&1
 
-  rmdir "$lock_dir" 2>/dev/null
+  release_cred_lock
   return 0
 }
 
@@ -373,7 +425,9 @@ main() {
   if [[ -z "$token" ]]; then
     if [[ "$TOKEN_SOURCE" == "file-refresh-failed" ]]; then
       handle_refresh_failure
-    else
+    elif [[ "$TOKEN_SOURCE" != "lock_held" ]]; then
+      # lock_held: a sibling render already owns this refresh — just
+      # return, no message, no artifact. The winner's result stands.
       echo "${DIM}Usage: Could not get credentials${RESET}" >&2
     fi
     exit 0

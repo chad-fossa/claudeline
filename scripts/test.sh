@@ -76,6 +76,15 @@ CAPTURE_DETECT_SRC=$(extract_func "$CAPTURE" detect_account)
 assert_eq "detect_account identical in statusline + hook" "$DETECT_SRC" "$HOOK_DETECT_SRC"
 assert_eq "detect_account identical in statusline + capture script" "$DETECT_SRC" "$CAPTURE_DETECT_SRC"
 
+# Same-lock sync: hook and capture script each inline their own copy of
+# the cred-lock helpers (capture script is standalone, can't source the
+# hook) — keep them byte-identical.
+for fn in cred_lock_dir acquire_cred_lock release_cred_lock; do
+  hook_fn_src=$(extract_func "$HOOK" "$fn")
+  capture_fn_src=$(extract_func "$CAPTURE" "$fn")
+  assert_eq "$fn identical in hook + capture script" "$hook_fn_src" "$capture_fn_src"
+done
+
 eval "$DETECT_SRC"
 
 unset CLAUDE_CONFIG_DIR
@@ -206,6 +215,13 @@ unset _CREDS_DIR SECURITY_STUB_SENTINEL
 # ─────────────────────────────────────────────────────────────
 # Area: refresh_token_grant (owned OAuth refresh)
 # ─────────────────────────────────────────────────────────────
+CLD_SRC=$(extract_func "$HOOK" cred_lock_dir)
+ACL_SRC=$(extract_func "$HOOK" acquire_cred_lock)
+RCL_SRC=$(extract_func "$HOOK" release_cred_lock)
+eval "$CLD_SRC"
+eval "$ACL_SRC"
+eval "$RCL_SRC"
+
 REFRESH_SRC=$(extract_func "$HOOK" refresh_token_grant)
 eval "$REFRESH_SRC"
 
@@ -304,6 +320,22 @@ refresh_token_grant
 result=$?
 [[ "$result" != "0" ]]; check "lock held: refresh_token_grant refuses" $?
 assert_eq "lock held: file content unchanged" "$before_content" "$(cat "$RCREDS_DIR/.credentials.json")"
+assert_eq "lock held: REFRESH_FAIL_REASON=lock_held" "lock_held" "$REFRESH_FAIL_REASON"
+rmdir "/tmp/.claude_cred_lock_clltest" 2>/dev/null
+
+# Stale lock (age > 120s) is reclaimed rather than treated as held —
+# covers a SIGKILL'd holder that never released its lock.
+mkdir -p "/tmp/.claude_cred_lock_clltest"
+old_ts=$(( $(date +%s) - 200 ))
+touch -t "$(date -r "$old_ts" +%Y%m%d%H%M.%S 2>/dev/null || date -d "@$old_ts" +%Y%m%d%H%M.%S)" "/tmp/.claude_cred_lock_clltest" 2>/dev/null
+cat > "$RCREDS_DIR/.credentials.json" <<'EOF'
+{"claudeAiOauth":{"accessToken":"tok_fake_stale","refreshToken":"rtok_fake_stale","expiresAt":1000}}
+EOF
+export OAUTH_HTTP_CODE=200
+export OAUTH_RESPONSE_BODY='{"access_token":"tok_fake_reclaimed","refresh_token":"rtok_fake_reclaimed","expires_in":3600}'
+refresh_token_grant
+check "stale lock (age>120s): reclaimed, refresh succeeds" $?
+assert_eq "stale lock: accessToken rewritten after reclaim" "tok_fake_reclaimed" "$(jq -r '.claudeAiOauth.accessToken' "$RCREDS_DIR/.credentials.json")"
 rmdir "/tmp/.claude_cred_lock_clltest" 2>/dev/null
 
 unset OAUTH_HTTP_CODE OAUTH_RESPONSE_BODY
@@ -484,6 +516,26 @@ assert_eq "500 e2e: credentials file unchanged" "$before_e2e_creds" "$(cat "$E2E
 assert_eq "500 e2e: cache token_source=file-refresh-failed" "file-refresh-failed" "$(jq -r '.token_source' "/tmp/.claude_usage_limits_personal.json")"
 assert_eq "500 e2e: cache numbers untouched" "42" "$(jq -r '.five_hour.utilization' "/tmp/.claude_usage_limits_personal.json")"
 
+# lock_held e2e: a sibling render already owns the refresh — this render
+# must be a BENIGN SILENT SKIP (no failure artifact, no token_source
+# mutation, no ! marker) rather than treating lock contention as a
+# refresh failure.
+rm -f "/tmp/.claude_cred_refresh_failed_personal"
+cat > "/tmp/.claude_usage_limits_personal.json" <<'EOF'
+{"five_hour":{"utilization":42},"seven_day":{"utilization":7},"fetched_at":1,"token_source":"file"}
+EOF
+before_lockheld_cache=$(cat "/tmp/.claude_usage_limits_personal.json")
+mkdir -p "/tmp/.claude_cred_lock_personal"
+
+CLAUDE_CONFIG_DIR="$E2E_CREDS_DIR" PATH="$E2ECURL:$PATH" bash "$HOOK" </dev/null >/dev/null 2>/tmp/.cll_lockheld_stderr
+
+[[ ! -f "/tmp/.claude_cred_refresh_failed_personal" ]]; check "lock_held e2e: no refresh-failed artifact" $?
+assert_eq "lock_held e2e: cache untouched (still token_source=file)" "$before_lockheld_cache" "$(cat "/tmp/.claude_usage_limits_personal.json")"
+[[ ! -s /tmp/.cll_lockheld_stderr ]]; check "lock_held e2e: silent (no stderr)" $?
+
+rmdir "/tmp/.claude_cred_lock_personal" 2>/dev/null
+rm -f /tmp/.cll_lockheld_stderr
+
 rm -rf "$E2E_DIR" "$E2ECURL" "$CURLSTUB2"
 rm -f "/tmp/.claude_usage_limits_personal.json" "/tmp/.claude_cred_refresh_failed_personal" /tmp/.cll_e2e_stderr
 rmdir "/tmp/.claude_cred_lock_personal" 2>/dev/null
@@ -609,6 +661,20 @@ PATH="$CAPPATH" bash -c "unset CLAUDE_CONFIG_DIR; bash '$CAPTURE'" >/dev/null 2>
 cap_status=$?
 [[ "$cap_status" != "0" ]]; check "capture ACCOUNT_ASSUMED=1: exits 1" $?
 [[ ! -f "$HOME/.claude/.credentials.json" ]]; check "capture ACCOUNT_ASSUMED=1: no file written" $?
+
+# Manual capture blocked while the cred lock is held (e.g. by an
+# in-flight refresh) -- exits loudly (skip-loudly, not wait) rather than
+# racing the write.
+CAP_CONFIG_DIR6="$CAP_DIR/claude-personal-lockheld"
+mkdir -p "$CAP_CONFIG_DIR6"
+echo '{"oauthAccount":{"accountUuid":"profile-uuid-abc","profileFetchedAt":1783657301823}}' > "$CAP_CONFIG_DIR6/.claude.json"
+mkdir -p "/tmp/.claude_cred_lock_personal"
+cap_out6=$(CLAUDE_CONFIG_DIR="$CAP_CONFIG_DIR6" PATH="$CAPPATH" bash "$CAPTURE" 2>&1)
+cap_status=$?
+[[ "$cap_status" != "0" ]]; check "manual capture blocked while lock held: exits 1" $?
+[[ ! -f "$CAP_CONFIG_DIR6/.credentials.json" ]]; check "manual capture blocked while lock held: no file written" $?
+[[ -n "$cap_out6" ]]; check "manual capture blocked while lock held: loud message" $?
+rmdir "/tmp/.claude_cred_lock_personal" 2>/dev/null
 
 rm -rf "$CAP_DIR" "$CAPSEC" "$CAPCURL"
 

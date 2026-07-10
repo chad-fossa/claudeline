@@ -20,6 +20,42 @@ detect_account() {
 }
 detect_account
 
+# Same lock hooks/show-usage-limits.sh uses for refresh_token_grant and
+# maybe_auto_capture — inlined here byte-identically (standalone script,
+# can't source the hook) so manual capture can't race an in-flight
+# refresh. scripts/test.sh asserts the two copies stay in sync.
+cred_lock_dir() {
+  printf '/tmp/.claude_cred_lock_%s' "$ACCOUNT_ID"
+}
+
+acquire_cred_lock() {
+  local lock_dir
+  lock_dir=$(cred_lock_dir)
+
+  if [[ -d "$lock_dir" ]]; then
+    local now mtime age
+    now=$(date +%s)
+    mtime=$(stat -f%m "$lock_dir" 2>/dev/null || stat -c%Y "$lock_dir" 2>/dev/null || echo "$now")
+    age=$((now - mtime))
+    ((age > 120)) && rmdir "$lock_dir" 2>/dev/null
+  fi
+
+  mkdir "$lock_dir" 2>/dev/null || return 1
+  _CRED_LOCK_PREV_TRAP=$(trap -p EXIT)
+  trap 'rmdir "'"$lock_dir"'" 2>/dev/null' EXIT
+  return 0
+}
+
+release_cred_lock() {
+  rmdir "$(cred_lock_dir)" 2>/dev/null
+  if [[ -n "$_CRED_LOCK_PREV_TRAP" ]]; then
+    eval "$_CRED_LOCK_PREV_TRAP"
+  else
+    trap - EXIT
+  fi
+  _CRED_LOCK_PREV_TRAP=""
+}
+
 if [[ "$ACCOUNT_ASSUMED" == "1" ]]; then
   echo "set CLAUDE_CONFIG_DIR explicitly or run from the profile's session" >&2
   exit 1
@@ -36,15 +72,26 @@ fi
 profile_fetched_at=$(jq -r '.oauthAccount.profileFetchedAt // empty' "$CONFIG_DIR/.claude.json" 2>/dev/null)
 profile_email=$(jq -r '.oauthAccount.emailAddress // .oauthAccount.email // "unknown"' "$CONFIG_DIR/.claude.json" 2>/dev/null)
 
+# Same lock refresh_token_grant/maybe_auto_capture hold in the hook, so a
+# manual capture can't race an in-flight refresh. A held lock means one of
+# those is already touching this account's credentials file — skip loudly
+# rather than wait or corrupt the write.
+if ! acquire_cred_lock; then
+  echo "capture skipped: credential lock held by an in-flight refresh/capture — try again shortly" >&2
+  exit 1
+fi
+
 creds=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null)
 if [[ -z "$creds" ]]; then
   echo "no Claude Code-credentials entry in Keychain" >&2
+  release_cred_lock
   exit 1
 fi
 
 oauth_blob=$(echo "$creds" | jq -c '.claudeAiOauth' 2>/dev/null)
 if [[ -z "$oauth_blob" || "$oauth_blob" == "null" ]]; then
   echo "failed to parse claudeAiOauth from Keychain entry" >&2
+  release_cred_lock
   exit 1
 fi
 
@@ -89,9 +136,10 @@ verify_capture_identity "$access_token" "$uuid"
 
 if [[ "$VERIFY_STATUS" == "mismatch" ]]; then
   artifact="/tmp/.claude_cred_capture_vetoed_${ACCOUNT_ID}"
-  printf '%s profile_uuid=%s probe_uuid=%s profile_email=%s probe_email=%s\n' \
+  printf '%s reason=identity_mismatch profile_uuid=%s probe_uuid=%s profile_email=%s probe_email=%s\n' \
     "$(date +%s)" "$uuid" "$PROBE_UUID" "$profile_email" "$PROBE_EMAIL" > "$artifact"
   echo "capture VETOED: keychain session belongs to a different account than this profile (profile uuid=${uuid} email=${profile_email}; keychain probe uuid=${PROBE_UUID} email=${PROBE_EMAIL})" >&2
+  release_cred_lock
   exit 1
 fi
 
@@ -117,6 +165,7 @@ fi
 
 chmod 600 "$tmp_file"
 mv "$tmp_file" "$dest_file"
+release_cred_lock
 
 email=$(echo "$oauth_blob" | jq -r '.email // "unknown"')
 expiry=$(echo "$oauth_blob" | jq -r '.expiresAt // "unknown"')
