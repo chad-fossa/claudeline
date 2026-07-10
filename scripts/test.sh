@@ -201,6 +201,163 @@ rm -rf "$SECSTUB" "$CREDS_TEST_DIR"
 unset _CREDS_DIR SECURITY_STUB_SENTINEL
 
 # ─────────────────────────────────────────────────────────────
+# Area: refresh_token_grant (owned OAuth refresh)
+# ─────────────────────────────────────────────────────────────
+REFRESH_SRC=$(extract_func "$HOOK" refresh_token_grant)
+eval "$REFRESH_SRC"
+
+CURLSTUB2=$(mktemp -d)
+cat > "$CURLSTUB2/curl" <<'EOF'
+#!/bin/bash
+url=""
+for arg in "$@"; do
+  [[ "$arg" == http* ]] && url="$arg"
+done
+oauth_body="${OAUTH_RESPONSE_BODY:-}"
+[[ -z "$oauth_body" ]] && oauth_body='{}'
+usage_body="${USAGE_RESPONSE_BODY:-}"
+[[ -z "$usage_body" ]] && usage_body='{"five_hour":{"utilization":10},"seven_day":{"utilization":5}}'
+
+if [[ "$url" == *"/v1/oauth/token"* ]]; then
+  printf '%s\n%s' "$oauth_body" "${OAUTH_HTTP_CODE:-200}"
+elif [[ "$url" == *"/api/oauth/usage"* ]]; then
+  printf '%s' "$usage_body"
+fi
+EOF
+chmod +x "$CURLSTUB2/curl"
+export PATH="$CURLSTUB2:$PATH"
+
+RCREDS_DIR=$(mktemp -d)
+_CREDS_DIR="$RCREDS_DIR"
+ACCOUNT_ID="clltest"
+ACCOUNT_ASSUMED=0
+rmdir "/tmp/.claude_cred_lock_clltest" 2>/dev/null
+
+# 200 with rotation
+cat > "$RCREDS_DIR/.credentials.json" <<'EOF'
+{"claudeAiOauth":{"accessToken":"tok_fake_old","refreshToken":"rtok_fake_old","expiresAt":1000,"clientId":"custom-client","scopes":["a","b"]},"subscriptionType":"max"}
+EOF
+export OAUTH_HTTP_CODE=200
+export OAUTH_RESPONSE_BODY='{"access_token":"tok_fake_new","refresh_token":"rtok_fake_new","expires_in":3600}'
+refresh_token_grant
+check "200-rotate: refresh_token_grant succeeds" $?
+assert_eq "200-rotate: accessToken rewritten" "tok_fake_new" "$(jq -r '.claudeAiOauth.accessToken' "$RCREDS_DIR/.credentials.json")"
+assert_eq "200-rotate: refreshToken rotated" "rtok_fake_new" "$(jq -r '.claudeAiOauth.refreshToken' "$RCREDS_DIR/.credentials.json")"
+[[ -f "$RCREDS_DIR/.credentials.json.bak" ]]; check "200-rotate: .bak exists" $?
+perms=$(stat -f%Lp "$RCREDS_DIR/.credentials.json" 2>/dev/null || stat -c%a "$RCREDS_DIR/.credentials.json" 2>/dev/null)
+assert_eq "200-rotate: perms 600" "600" "$perms"
+assert_eq "200-rotate: clientId preserved" "custom-client" "$(jq -r '.claudeAiOauth.clientId' "$RCREDS_DIR/.credentials.json")"
+assert_eq "200-rotate: subscriptionType preserved" "max" "$(jq -r '.subscriptionType' "$RCREDS_DIR/.credentials.json")"
+
+# 200 without rotation — response omits refresh_token
+cat > "$RCREDS_DIR/.credentials.json" <<'EOF'
+{"claudeAiOauth":{"accessToken":"tok_fake_old2","refreshToken":"rtok_fake_keep","expiresAt":1000}}
+EOF
+rm -f "$RCREDS_DIR/.credentials.json.bak"
+export OAUTH_RESPONSE_BODY='{"access_token":"tok_fake_new2","expires_in":3600}'
+refresh_token_grant
+check "200-no-rotate: refresh_token_grant succeeds" $?
+assert_eq "200-no-rotate: old refreshToken preserved when response omits it" "rtok_fake_keep" "$(jq -r '.claudeAiOauth.refreshToken' "$RCREDS_DIR/.credentials.json")"
+
+# 500 — file and .bak stay at pre-refresh content, no keychain fallback
+cat > "$RCREDS_DIR/.credentials.json" <<'EOF'
+{"claudeAiOauth":{"accessToken":"tok_fake_500","refreshToken":"rtok_fake_500","expiresAt":1000}}
+EOF
+before_content=$(cat "$RCREDS_DIR/.credentials.json")
+rm -f "$RCREDS_DIR/.credentials.json.bak"
+export OAUTH_HTTP_CODE=500
+export OAUTH_RESPONSE_BODY='{"error":"server_error"}'
+refresh_token_grant
+result=$?
+[[ "$result" != "0" ]]; check "500: refresh_token_grant returns failure" $?
+assert_eq "500: file content unchanged" "$before_content" "$(cat "$RCREDS_DIR/.credentials.json")"
+assert_eq "500: .bak matches pre-refresh content" "$before_content" "$(cat "$RCREDS_DIR/.credentials.json.bak" 2>/dev/null)"
+assert_eq "500: REFRESH_FAIL_REASON set" "http_500" "$REFRESH_FAIL_REASON"
+
+# ACCOUNT_ASSUMED=1 — refuses, no writes on a guessed identity
+ACCOUNT_ASSUMED=1
+cat > "$RCREDS_DIR/.credentials.json" <<'EOF'
+{"claudeAiOauth":{"accessToken":"tok_fake_assumed","refreshToken":"rtok_fake_assumed","expiresAt":1000}}
+EOF
+before_content=$(cat "$RCREDS_DIR/.credentials.json")
+rm -f "$RCREDS_DIR/.credentials.json.bak"
+export OAUTH_HTTP_CODE=200
+export OAUTH_RESPONSE_BODY='{"access_token":"tok_should_not_write","expires_in":3600}'
+refresh_token_grant
+result=$?
+[[ "$result" != "0" ]]; check "ACCOUNT_ASSUMED=1: refresh_token_grant refuses" $?
+[[ ! -f "$RCREDS_DIR/.credentials.json.bak" ]]; check "ACCOUNT_ASSUMED=1: no .bak written" $?
+assert_eq "ACCOUNT_ASSUMED=1: file content unchanged" "$before_content" "$(cat "$RCREDS_DIR/.credentials.json")"
+assert_eq "ACCOUNT_ASSUMED=1: REFRESH_FAIL_REASON=account_assumed" "account_assumed" "$REFRESH_FAIL_REASON"
+ACCOUNT_ASSUMED=0
+
+# Lock respected — a held lock refuses the refresh outright
+mkdir -p "/tmp/.claude_cred_lock_clltest"
+cat > "$RCREDS_DIR/.credentials.json" <<'EOF'
+{"claudeAiOauth":{"accessToken":"tok_fake_locked","refreshToken":"rtok_fake_locked","expiresAt":1000}}
+EOF
+before_content=$(cat "$RCREDS_DIR/.credentials.json")
+refresh_token_grant
+result=$?
+[[ "$result" != "0" ]]; check "lock held: refresh_token_grant refuses" $?
+assert_eq "lock held: file content unchanged" "$before_content" "$(cat "$RCREDS_DIR/.credentials.json")"
+rmdir "/tmp/.claude_cred_lock_clltest" 2>/dev/null
+
+unset OAUTH_HTTP_CODE OAUTH_RESPONSE_BODY
+rm -rf "$RCREDS_DIR"
+unset _CREDS_DIR
+
+# fetch_usage carries a network timeout (skills/usage/SKILL.md calls the
+# hook synchronously — an unbounded curl would hang the whole session)
+FETCH_USAGE_SRC=$(extract_func "$HOOK" fetch_usage)
+echo "$FETCH_USAGE_SRC" | grep -q -- '--max-time 5'
+check "fetch_usage uses --max-time 5" $?
+
+# ─────────────────────────────────────────────────────────────
+# Area: main() file-refresh-failed handling (artifact + cache merge,
+# no silent keychain fallback)
+# ─────────────────────────────────────────────────────────────
+E2E_DIR=$(mktemp -d)
+E2E_CREDS_DIR="$E2E_DIR/claude-personal"
+mkdir -p "$E2E_CREDS_DIR"
+
+past_ms=$(( ($(date +%s) - 3600) * 1000 ))
+cat > "$E2E_CREDS_DIR/.credentials.json" <<EOF
+{"claudeAiOauth":{"accessToken":"tok_fake_expired","refreshToken":"rtok_fake_e2e","expiresAt":$past_ms,"refreshTokenExpiresAt":$((past_ms + 999999999))}}
+EOF
+
+rm -f "/tmp/.claude_usage_limits_personal.json" "/tmp/.claude_cred_refresh_failed_personal"
+rmdir "/tmp/.claude_cred_lock_personal" 2>/dev/null
+cat > "/tmp/.claude_usage_limits_personal.json" <<'EOF'
+{"five_hour":{"utilization":42},"seven_day":{"utilization":7},"fetched_at":1,"token_source":"file"}
+EOF
+
+before_e2e_creds=$(cat "$E2E_CREDS_DIR/.credentials.json")
+
+E2ECURL=$(mktemp -d)
+cat > "$E2ECURL/curl" <<'EOF'
+#!/bin/bash
+url=""
+for arg in "$@"; do
+  [[ "$arg" == http* ]] && url="$arg"
+done
+[[ "$url" == *"/v1/oauth/token"* ]] && printf '%s\n%s' '{"error":"server_error"}' "500"
+EOF
+chmod +x "$E2ECURL/curl"
+
+CLAUDE_CONFIG_DIR="$E2E_CREDS_DIR" PATH="$E2ECURL:$PATH" bash "$HOOK" </dev/null >/dev/null 2>/tmp/.cll_e2e_stderr
+
+assert_eq "500 e2e: credentials file unchanged" "$before_e2e_creds" "$(cat "$E2E_CREDS_DIR/.credentials.json")"
+[[ -f "$E2E_CREDS_DIR/.credentials.json.bak" ]]; check "500 e2e: .bak created" $?
+[[ -f "/tmp/.claude_cred_refresh_failed_personal" ]]; check "500 e2e: refresh-failed artifact created" $?
+assert_eq "500 e2e: cache token_source=file-refresh-failed" "file-refresh-failed" "$(jq -r '.token_source' "/tmp/.claude_usage_limits_personal.json")"
+assert_eq "500 e2e: cache numbers untouched" "42" "$(jq -r '.five_hour.utilization' "/tmp/.claude_usage_limits_personal.json")"
+
+rm -rf "$E2E_DIR" "$E2ECURL" "$CURLSTUB2"
+rm -f "/tmp/.claude_usage_limits_personal.json" "/tmp/.claude_cred_refresh_failed_personal" /tmp/.cll_e2e_stderr
+rmdir "/tmp/.claude_cred_lock_personal" 2>/dev/null
+
+# ─────────────────────────────────────────────────────────────
 # Area: render markers (shared_login_marker / unverifiable_marker)
 # ─────────────────────────────────────────────────────────────
 DIM=$'\033[2m'

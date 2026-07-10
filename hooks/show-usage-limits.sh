@@ -103,10 +103,88 @@ get_token() {
   fi
 }
 
+# Refresh the file-based OAuth token by POSTing the stored refresh_token
+# to Anthropic's OAuth endpoint. Refuses on ACCOUNT_ASSUMED (no writes on
+# a guessed identity) and when another refresh is already in flight
+# (mkdir-based lock — wraps the whole read/POST/write critical section;
+# mkdir over statusline's touch+age guard because this section WRITES
+# credentials and needs true mutual exclusion, not a stampede guard).
+# Sets REFRESH_FAIL_REASON on failure. Never falls back to Keychain.
+refresh_token_grant() {
+  REFRESH_FAIL_REASON=""
+  local creds_file="${_CREDS_DIR}/.credentials.json"
+
+  if [[ "$ACCOUNT_ASSUMED" == "1" ]]; then
+    REFRESH_FAIL_REASON="account_assumed"
+    return 1
+  fi
+
+  local lock_dir="/tmp/.claude_cred_lock_${ACCOUNT_ID}"
+  if ! mkdir "$lock_dir" 2>/dev/null; then
+    REFRESH_FAIL_REASON="lock_held"
+    return 1
+  fi
+
+  local refresh_token client_id scopes
+  refresh_token=$(jq -r '.claudeAiOauth.refreshToken // empty' "$creds_file" 2>/dev/null)
+  client_id=$(jq -r '.claudeAiOauth.clientId // "9d1c250a-e61b-44d9-88ed-5944d1962f5e"' "$creds_file" 2>/dev/null)
+  scopes=$(jq -r '(.claudeAiOauth.scopes // []) | join(" ")' "$creds_file" 2>/dev/null)
+
+  if [[ -z "$refresh_token" ]]; then
+    REFRESH_FAIL_REASON="no_refresh_token"
+    rmdir "$lock_dir" 2>/dev/null
+    return 1
+  fi
+
+  cp "$creds_file" "${creds_file}.bak"
+
+  local body response http_code payload
+  body=$(jq -n --arg rt "$refresh_token" --arg cid "$client_id" --arg scope "$scopes" \
+    '{grant_type: "refresh_token", refresh_token: $rt, client_id: $cid, scope: $scope}')
+
+  response=$(curl -s -w '\n%{http_code}' --max-time 5 \
+    -X POST "https://platform.claude.com/v1/oauth/token" \
+    -H "Content-Type: application/json" \
+    -d "$body" 2>/dev/null)
+  http_code="${response##*$'\n'}"
+  payload="${response%$'\n'*}"
+
+  if [[ "$http_code" != "200" ]] || ! echo "$payload" | jq -e . >/dev/null 2>&1; then
+    REFRESH_FAIL_REASON="http_${http_code:-timeout}"
+    rmdir "$lock_dir" 2>/dev/null
+    return 1
+  fi
+
+  local access_token new_refresh_token expires_in now_ms new_expires_at
+  access_token=$(echo "$payload" | jq -r '.access_token // empty')
+  new_refresh_token=$(echo "$payload" | jq -r '.refresh_token // empty')
+  expires_in=$(echo "$payload" | jq -r '.expires_in // empty')
+
+  if [[ -z "$access_token" || -z "$expires_in" ]]; then
+    REFRESH_FAIL_REASON="parse_failure"
+    rmdir "$lock_dir" 2>/dev/null
+    return 1
+  fi
+
+  [[ -z "$new_refresh_token" ]] && new_refresh_token="$refresh_token"
+  now_ms=$(( $(date +%s) * 1000 ))
+  new_expires_at=$(( now_ms + expires_in * 1000 ))
+
+  local tmp_file="${creds_file}.tmp"
+  jq --arg at "$access_token" --arg rt "$new_refresh_token" --argjson exp "$new_expires_at" \
+    '.claudeAiOauth.accessToken = $at | .claudeAiOauth.refreshToken = $rt | .claudeAiOauth.expiresAt = $exp' \
+    "$creds_file" > "$tmp_file"
+  chmod 600 "$tmp_file"
+  mv "$tmp_file" "$creds_file"
+
+  rmdir "$lock_dir" 2>/dev/null
+  return 0
+}
+
 # Fetch usage limits from API
 fetch_usage() {
   local token=$1
-  curl -s "https://api.anthropic.com/api/oauth/usage" \
+  curl -s --max-time 5 "https://api.anthropic.com/api/oauth/usage" \
     -H "Accept: application/json" \
     -H "Content-Type: application/json" \
     -H "User-Agent: claude-code/2.0.32" \
@@ -149,6 +227,25 @@ mini_bar() {
   printf '%s%s%s%s' "$color" "$bar" "$DIM$empty_bar" "$RESET"
 }
 
+# A failed file-based refresh never falls back to Keychain silently: drop a
+# loud artifact, merge token_source into whatever cache already exists
+# (leaving its numbers untouched), and let the render continue on stale data.
+handle_refresh_failure() {
+  local reason="${REFRESH_FAIL_REASON:-unknown}"
+  local artifact="/tmp/.claude_cred_refresh_failed_${ACCOUNT_ID}"
+  printf '%s %s\n' "$(date +%s)" "$reason" > "$artifact"
+
+  if [[ -f "$CACHE_FILE" ]]; then
+    local merged
+    merged=$(jq '. + {token_source: "file-refresh-failed"}' "$CACHE_FILE" 2>/dev/null)
+    [[ -n "$merged" ]] && echo "$merged" > "$CACHE_FILE"
+  else
+    jq -n '{token_source: "file-refresh-failed"}' > "$CACHE_FILE"
+  fi
+
+  echo "${DIM}Usage: credential refresh failed (${reason})${RESET}" >&2
+}
+
 # Main
 main() {
   # Read hook input (contains session info)
@@ -158,7 +255,11 @@ main() {
   get_token
   local token="$TOKEN"
   if [[ -z "$token" ]]; then
-    echo "${DIM}Usage: Could not get credentials${RESET}" >&2
+    if [[ "$TOKEN_SOURCE" == "file-refresh-failed" ]]; then
+      handle_refresh_failure
+    else
+      echo "${DIM}Usage: Could not get credentials${RESET}" >&2
+    fi
     exit 0
   fi
 
@@ -171,7 +272,8 @@ main() {
 
   # Write to cache file with timestamp
   local cache_data
-  cache_data=$(echo "$usage" | jq --arg ts "$(date +%s)" '. + {fetched_at: ($ts | tonumber)}')
+  cache_data=$(echo "$usage" | jq --arg ts "$(date +%s)" --arg src "$TOKEN_SOURCE" \
+    '. + {fetched_at: ($ts | tonumber), token_source: $src}')
   echo "$cache_data" > "$CACHE_FILE"
 
   # Parse for display
