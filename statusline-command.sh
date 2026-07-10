@@ -313,9 +313,13 @@ get_context() {
     return
   fi
 
-  # Fallback: calculate manually from token counts
+  # Fallback: calculate manually from token counts. `// 200000` only
+  # defaults on JSON null, not on a non-numeric string, so size must be
+  # validated (same pattern as used_percentage above) before it reaches
+  # $(( )) below — an unvalidated string here is arithmetic injection.
   local size current
   size=$(echo "$INPUT" | jq -r '.context_window.context_window_size // 200000')
+  [[ "$size" =~ ^[0-9]+$ ]] || size=200000
   current=$(echo "$INPUT" | jq -r '(.context_window.current_usage // {}) | ((.input_tokens // 0) + (.cache_creation_input_tokens // 0) + (.cache_read_input_tokens // 0))')
   percent=$((size > 0 ? current * 100 / size : 0))
   echo "$percent"

@@ -482,6 +482,22 @@ assert_eq "test_malicious_context_used_percentage_no_execution: statusline exits
 echo "$d1_ctx_out" | grep -qi 'system\|command not found\|syntax error'
 [[ $? -ne 0 ]]; check "test_malicious_context_used_percentage_no_execution: no injected payload text or shell error in output" $?
 
+# FIX1: context_window_size is fed to bash arithmetic ($(( size > 0 ? ... )))
+# unvalidated — jq's `// 200000` default only fires on JSON null, not on a
+# string, so a string value reaches $(( )) as-is. Array-subscript
+# command substitution inside arithmetic evaluation executes under both
+# bash 3.2 and 5.2. Marker file proves no execution occurred; percent must
+# still render using the 200000 default.
+rm -f /tmp/.cll_fix1_marker
+d1_size_json=$(jq -n '{workspace:{current_dir:"/tmp"}, context_window:{context_window_size:"x[$(touch /tmp/.cll_fix1_marker)]", current_usage:{input_tokens:1000}}}')
+d1_size_out=$(printf '%s' "$d1_size_json" | CLAUDE_CONFIG_DIR="$HOME/.claude" bash "$STATUSLINE" 2>&1)
+d1_size_status=$?
+assert_eq "test_malicious_context_window_size_no_execution: statusline exits 0" "0" "$d1_size_status"
+[[ ! -f /tmp/.cll_fix1_marker ]]; check "test_malicious_context_window_size_no_execution: injection payload not executed" $?
+echo "$d1_size_out" | grep -q '0%'
+check "test_malicious_context_window_size_no_execution: context bar still renders using the 200000 default" $?
+rm -f /tmp/.cll_fix1_marker
+
 # D1: legitimate float used_percentage (real payload shape) still
 # validates and renders.
 d1_float_json=$(jq -n '{
