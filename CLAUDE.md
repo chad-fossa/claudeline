@@ -1,14 +1,16 @@
 # claudeline — contributor notes
 
-A bash statusline for Claude Code. Runs as `statusLine.command` per session, plus a `SessionStart` hook (`hooks/show-usage-limits.sh`) that fetches usage limits via the Anthropic OAuth API and caches them at `/tmp/claudeline-<uid>/.claude_usage_limits_{account}.json`.
+A bash statusline for Claude Code. Runs as `statusLine.command` per session. Usage limits arrive on the statusline's own stdin (`rate_limits.five_hour`/`.seven_day`, sent by Claude Code ≥2.1.80) — no fetch, no hook, no credentials. `statusline-command.sh` renders it and writes a per-account cache at `/tmp/claudeline-<uid>/.claude_usage_limits_{account}.json` so a render that arrives before the session's first API response still has something to show.
 
 ## Versioning
 
 This project follows [Semantic Versioning](https://semver.org):
 
-- **MAJOR** — incompatible changes to the install layout, settings schema, hook output contract, or required Claude Code version
-- **MINOR** — new statusline segments, new env-var knobs, new hooks/skills, new account modes
+- **MAJOR** — incompatible changes to the install layout, settings schema, statusline input/output contract, or required Claude Code version
+- **MINOR** — new statusline segments, new env-var knobs, new skills, new account modes
 - **PATCH** — bug fixes, doc tweaks, performance work, no behavioral surface change
+
+Pre-1.0, a removal (deleted files, a changed install layout) can still ship as MINOR rather than MAJOR — but only with a loud, explicit callout in the CHANGELOG (see v0.7.0's `### Breaking` section for the pattern). Don't bury a removal in prose; a reader skimming section headers should be able to find it.
 
 Each release is a `vMAJOR.MINOR.PATCH` git tag on the commit that bumps `CHANGELOG.md`.
 
@@ -45,21 +47,16 @@ Use the commit that matches the changelog content, not the latest commit.
 
 ## Testing changes
 
-The hook depends on macOS Keychain access (`security find-generic-password -s "Claude Code-credentials"`) and a network call to `api.anthropic.com/api/oauth/usage`. To test locally without restarting Claude Code:
+Usage limits arrive on stdin — there's no fetch to stub, no credentials, no network call. Feed `statusline-command.sh` a JSON payload with `rate_limits` set to exercise it:
 
 ```bash
-# Work account (CLAUDE_CONFIG_DIR unset or = ~/.claude)
-bash hooks/show-usage-limits.sh
+echo '{"workspace":{"current_dir":"."},"context_window":{"used_percentage":5},"rate_limits":{"five_hour":{"used_percentage":10,"resets_at":1783699800},"seven_day":{"used_percentage":16,"resets_at":1783850400}}}' | bash statusline-command.sh
 
-# Personal account
-CLAUDE_CONFIG_DIR=$HOME/.claude-personal bash hooks/show-usage-limits.sh
-
-# Inspect the cache
+# Inspect the cache it writes for a render that arrives before rate_limits does
 cat /tmp/claudeline-<uid>/.claude_usage_limits_work.json
-cat /tmp/claudeline-<uid>/.claude_usage_limits_personal.json
 ```
 
-The cache file is what the statusline reads — if it doesn't exist or is stale, the `5h:X% 7d:X%` segment won't render.
+The cache file is what a `rate_limits`-less render falls back to — if it doesn't exist, or its schema is unrecognized (an old pre-v0.7.0 cache), the `5h:X% 7d:X%` segment won't render (never a fabricated `0%`).
 
 `scripts/test.sh` is this repo's smoke-test harness — no CI runs it, so run it manually before landing changes:
 
@@ -67,23 +64,18 @@ The cache file is what the statusline reads — if it doesn't exist or is stale,
 bash scripts/test.sh
 ```
 
-It asserts the load-bearing invariant that `detect_account()` is duplicated verbatim across `statusline-command.sh`, `hooks/show-usage-limits.sh`, and `scripts/capture-profile-session.sh` (all three install/run independently, so no shared lib) — all three copies must stay identical.
+`detect_account()` and `verify_runtime_dir()` are the sole copy in `statusline-command.sh` — there's no hook or capture script left to keep them in sync with.
 
-The hook's file-first credentials and owned OAuth refresh (v0.6.0) are tested with PATH-shimmed `curl` and `security` stubs under the isolated `$HOME` — a `curl` stub keyed on URL (`/v1/oauth/token` vs `/api/oauth/usage`) returns configurable bodies/HTTP codes via env vars (`OAUTH_HTTP_CODE`, `OAUTH_RESPONSE_BODY`, `USAGE_RESPONSE_BODY`), and a `security` stub with a sentinel file lets tests assert Keychain was (or wasn't) invoked. Fake tokens only (`tok_fake_*`) — never real-looking token shapes, even in test fixtures.
-
-Identity verification and auto-capture (also v0.6.0) extend the same pattern:
-- The capture script's identity probe (`/api/oauth/profile`) gets its own `curl` stub keyed on `PROFILE_HTTP_CODE`/`PROFILE_RESPONSE_BODY`, separate from the refresh stub above since both can be in play in the same test file.
-- Auto-capture's corroboration window reads the Keychain item's modification time WITHOUT `-w` (metadata only, never the secret) — its `security` stub branches on whether `-w` is present and, when absent, prints a fake `attributes:` block with an `"mdat"<timestamp>="YYYYMMDDHHMMSSZ"` line the hook parses. Tests compute that timestamp from real epoch offsets (`epoch_to_mdat_ts()`) around the current time rather than hardcoding a date, so the corroboration-window math stays correct regardless of when the suite runs.
+PR detection still shells out to `gh` when stdin doesn't carry `.pr` — that path is tested with a PATH-shimmed `gh` stub under the isolated `$HOME`, asserting it's invoked (or not) depending on whether the test payload carries `.pr`.
 
 ## Known upstream constraints
 
-- macOS Keychain stores only one Claude Max OAuth token (`Claude Code-credentials`); `/login` on a second account overwrites the first. Tracked at [anthropics/claude-code#20553](https://github.com/anthropics/claude-code/issues/20553). Work around by re-`/login`-ing on switch.
-- `ANTHROPIC_API_KEY` and `CLAUDE_CODE_OAUTH_TOKEN` env vars override OAuth and force inference-only mode. The hook will still read the keychain, but the active session itself loses Remote Control. Don't export either globally.
+- `ANTHROPIC_API_KEY` and `CLAUDE_CODE_OAUTH_TOKEN` env vars override OAuth and force inference-only mode; usage limits don't apply in that mode, so `rate_limits` won't appear on stdin. Don't export either globally if you want the usage segment.
 
 ## Experts
 
 - consult-expert: claudeline-distribution — install.sh, settings-example.json, README.md, CHANGELOG.md, CLAUDE.md, LICENSE: fresh-install layout and release/versioning discipline.
-- consult-expert: claudeline-core — statusline-command.sh, hooks/, skills/usage/: statusline render+refresh cycle, cache contract, account detection, OAuth acquisition.
+- consult-expert: claudeline-core — statusline-command.sh, skills/usage/: statusline render cycle, stdin usage contract, cache contract, account detection.
   `<!-- cf:orientation -->` marker onward) to the consuming repo's ROOT CLAUDE.md in SHARED
   mode only. It intentionally makes NO mention of change-factory — the committed experts load
   as ordinary Claude Code subagents, so the orientation must read correctly for any teammate

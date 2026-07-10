@@ -3,6 +3,26 @@
 All notable changes to this project follow [Semantic Versioning](https://semver.org).
 Each release corresponds to a `vMAJOR.MINOR.PATCH` git tag.
 
+## v0.7.0 (2026-07-10)
+
+### Breaking
+
+Both profiles' statuslines showed the same usage numbers because we fetched usage with a shared keychain token — v0.6.x's OAuth token came from the single shared macOS keychain slot (`Claude Code-credentials`), so whichever profile logged in last owned both bars. Claude Code ≥2.1.80 hands each session its own usage on stdin (`rate_limits.five_hour`/`.seven_day`) — verified live this session: work carried 5h=10%/7d=16% while personal carried 5h=14%/7d=7%, simultaneously, no auth — so we stopped fetching. The entire credential subsystem that fetched, refreshed, and cross-profile-captured that token is now deleted; cross-profile leakage becomes structurally impossible, since each bar can only render the usage its own session's stdin carries.
+
+This is pre-1.0, so the removal below ships as a MINOR per this project's own versioning table — but it deletes installed files and changes the install layout, so treat it as breaking:
+
+- **Deleted files**: `hooks/show-usage-limits.sh`, `scripts/capture-profile-session.sh`.
+- **Deleted from `statusline-command.sh`**: `maybe_refresh_usage_cache`, `resolve_usage_refresh_hook`/`USAGE_REFRESH_HOOK`, `USAGE_CACHE_TTL_SECONDS`, `parse_iso_utc`, `unverifiable_marker` and its `?`/`!` markers, `token_source`/`provenance` cache fields.
+- **Deleted from `install.sh`/`settings-example.json`**: the hook/capture-script downloads and the `hooks.SessionStart` wiring. Statusline + the `/usage` skill are the only artifacts installed now.
+- **Markers**: `?` (unverifiable) and `!` (refresh-failed) are gone — there's no fetch-time credential state left to flag. The dim `=` marker (both profiles logged into the same account) stays, since it reads `.claude.json` directly and has nothing to do with usage fetching.
+- **Cache schema**: mirrors stdin verbatim now — `{five_hour:{used_percentage,resets_at},seven_day:{...},fetched_at}`, with `resets_at` as a raw epoch int instead of an ISO string. An old v0.6.x-shaped cache is unrecognized and treated as absent (never renders a fabricated `0%`); the next stdin-carrying render overwrites it.
+- **Requirements**: Claude Code ≥2.1.80, and a Claude.ai Pro or Max plan (usage limits don't apply otherwise). Usage is blank until the session's first API response — there's no pre-fetch anymore, so a brand-new session simply has nothing to show yet.
+- **Migration**: `rm -f ~/.claude/hooks/show-usage-limits.sh ~/.claude*/scripts/capture-profile-session.sh` — stale caches from the old schema are auto-ignored, nothing else to do.
+- [anthropics/claude-code#20553](https://github.com/anthropics/claude-code/issues/20553) (the single-keychain-slot issue that motivated the `?`/`!` markers in the first place) no longer affects claudeline — usage isn't fetched via Keychain anymore, so there's nothing left to leak.
+
+### Fixes
+- **PR number**: now read from stdin (`.pr.number`/`.pr.url`) when Claude Code already resolved it for the session, falling back to the existing `gh pr view` lookup only when stdin doesn't carry a PR.
+
 ## v0.6.1 (2026-07-10)
 
 ### Fixes
