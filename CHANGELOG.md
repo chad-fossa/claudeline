@@ -3,6 +3,22 @@
 All notable changes to this project follow [Semantic Versioning](https://semver.org).
 Each release corresponds to a `vMAJOR.MINOR.PATCH` git tag.
 
+## v0.6.0 (2026-07-10)
+
+### Fixes
+- **macOS cross-profile usage leak**: Symptom: both profiles' statuslines showed the *last-login* account's numbers, even after v0.5.0 made the mismatch visible via `?`. Root cause: macOS Keychain has one slot for the Claude Max OAuth token (`Claude Code-credentials`), and `hooks/show-usage-limits.sh` read that slot unconditionally on Darwin regardless of which profile was active. `get_token()` now tries this profile's own `.credentials.json` FIRST on every platform; Keychain is a fallback used only when the file is absent.
+
+### Added
+- **claudeline-owned OAuth refresh**: New `refresh_token_grant()` POSTs the file's stored refresh token to Anthropic's OAuth endpoint and rotates the file in place (pre-POST `.bak`, tmp + `chmod 600` + atomic `mv`) when its access token expires — no dependency on Claude Code itself to keep the file usable. A failed refresh never falls back to Keychain silently: it drops a loud `/tmp/.claude_cred_refresh_failed_<account>` artifact and renders a dim/red `!` marker instead (see [marker table](README.md#cross-profile-identity-markers)).
+- **`scripts/capture-profile-session.sh`**: New user-run script — copies the active Keychain session into the active profile's `.credentials.json` with a provenance stamp (`claudeline.captured_for_uuid`). Run it once per profile after `/login`; claudeline's owned refresh keeps the file usable after that, so logins become rare. See [Per-profile credentials (macOS)](README.md#per-profile-credentials-macos).
+- **Provenance-gated `?` suppression**: The cross-profile `?` marker (introduced in v0.5.0) now clears once a profile's usage numbers are demonstrably its own — `token_source=="file"` AND the file's `claudeline.captured_for_uuid` matches this profile's account UUID. Any other case (no file, hand-captured file, mismatch) keeps `?` exactly as v0.5.0 did.
+- **`scripts/test.sh`**: Extended with cases for file-first token resolution, `refresh_token_grant` (200 with/without refresh-token rotation, 500 leaves file/`.bak` untouched, `ACCOUNT_ASSUMED` refusal, lock contention), the capture script, and provenance-gated marker rendering (78 new cases).
+
+### Known issues
+- **Auto-capture is deferred to v0.6.1** — this release requires running `capture-profile-session.sh` manually once per profile after `/login`; automatically detecting a fresh login and re-capturing is planned for a follow-up release, pending a live soak of the owned-refresh path.
+- **Concurrent logins across profiles remain a residual risk** — if both profiles authenticate around the same time, the shared Keychain slot can still serve a stale/wrong session to whichever profile's capture runs last, exactly as before v0.6.0. Re-run the capture script per profile to resolve.
+- **A keychain-empty Claude Code login deletes the profile's `.credentials.json`** (binary-verified against claude 2.1.204) — the next hook invocation falls back to Keychain, `?` reappears. Re-run the capture script to restore file-first behavior.
+
 ## v0.5.0 (2026-07-06)
 
 ### Fixes

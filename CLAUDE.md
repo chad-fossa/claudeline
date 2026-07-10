@@ -67,7 +67,9 @@ The cache file is what the statusline reads — if it doesn't exist or is stale,
 bash scripts/test.sh
 ```
 
-It asserts the load-bearing invariant that `detect_account()` is duplicated verbatim across `statusline-command.sh` and `hooks/show-usage-limits.sh` (the two files install independently via curl, so no shared lib) — the two copies must stay identical.
+It asserts the load-bearing invariant that `detect_account()` is duplicated verbatim across `statusline-command.sh`, `hooks/show-usage-limits.sh`, and `scripts/capture-profile-session.sh` (all three install/run independently, so no shared lib) — all three copies must stay identical.
+
+The hook's file-first credentials and owned OAuth refresh (v0.6.0) are tested with PATH-shimmed `curl` and `security` stubs under the isolated `$HOME` — a `curl` stub keyed on URL (`/v1/oauth/token` vs `/api/oauth/usage`) returns configurable bodies/HTTP codes via env vars (`OAUTH_HTTP_CODE`, `OAUTH_RESPONSE_BODY`, `USAGE_RESPONSE_BODY`), and a `security` stub with a sentinel file lets tests assert Keychain was (or wasn't) invoked. Fake tokens only (`tok_fake_*`) — never real-looking token shapes, even in test fixtures.
 
 ## Known upstream constraints
 
