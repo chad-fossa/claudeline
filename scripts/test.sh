@@ -424,6 +424,9 @@ check "grep-verify: hooks/show-usage-limits.sh deleted" $?
 [[ ! -e "$REPO_ROOT/scripts/capture-profile-session.sh" ]]
 check "grep-verify: scripts/capture-profile-session.sh deleted" $?
 
+[[ ! -d "$REPO_ROOT/hooks" ]]
+check "grep-verify: hooks/ directory removed (nothing left to install into it)" $?
+
 # ─────────────────────────────────────────────────────────────
 # Summary
 # ─────────────────────────────────────────────────────────────
