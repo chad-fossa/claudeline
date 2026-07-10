@@ -406,6 +406,35 @@ check "stale lock (age>120s): reclaimed, refresh succeeds" $?
 assert_eq "stale lock: accessToken rewritten after reclaim" "tok_fake_reclaimed" "$(jq -r '.claudeAiOauth.accessToken' "$RCREDS_DIR/.credentials.json")"
 rmdir "${RUNTIME_DIR}/.claude_cred_lock_clltest" 2>/dev/null
 
+# F6: pin the 60s refresh buffer boundary exactly, via
+# resolve_file_credentials (the caller of the `expires_at -gt
+# now_ms+60000` check). expiresAt = now+59000 (inside the buffer, i.e.
+# NOT beyond it) -> refresh_token_grant IS invoked. expiresAt = now+61000
+# (outside/beyond the buffer) -> the file token is still treated as
+# valid; refresh_token_grant is NEVER invoked (no curl call at all).
+now_ms_f6=$(( $(date +%s) * 1000 ))
+cat > "$RCREDS_DIR/.credentials.json" <<EOF
+{"claudeAiOauth":{"accessToken":"tok_fake_f6_59","refreshToken":"rtok_fake_f6_59","expiresAt":$((now_ms_f6 + 59000))}}
+EOF
+export OAUTH_HTTP_CODE=200
+export OAUTH_RESPONSE_BODY='{"access_token":"tok_fake_f6_refreshed","refresh_token":"rtok_fake_f6_refreshed","expires_in":3600}'
+rm -f "$CURL_ARGV_LOG"
+resolve_file_credentials "$RCREDS_DIR/.credentials.json" "tok_fake_f6_59"
+assert_eq "F6: expiresAt=now+59000 (inside 60s buffer) -> refresh attempted (TOKEN_SOURCE=file via refresh)" "file" "$TOKEN_SOURCE"
+[[ -f "$CURL_ARGV_LOG" ]]; check "F6: expiresAt=now+59000 -> curl WAS invoked (refresh attempted)" $?
+rm -f "$CURL_ARGV_LOG"
+
+now_ms_f6=$(( $(date +%s) * 1000 ))
+cat > "$RCREDS_DIR/.credentials.json" <<EOF
+{"claudeAiOauth":{"accessToken":"tok_fake_f6_61","refreshToken":"rtok_fake_f6_61","expiresAt":$((now_ms_f6 + 61000))}}
+EOF
+rm -f "$CURL_ARGV_LOG"
+resolve_file_credentials "$RCREDS_DIR/.credentials.json" "tok_fake_f6_61"
+assert_eq "F6: expiresAt=now+61000 (outside 60s buffer) -> token still valid, TOKEN_SOURCE=file" "file" "$TOKEN_SOURCE"
+assert_eq "F6: expiresAt=now+61000 -> TOKEN unchanged (no refresh performed)" "tok_fake_f6_61" "$TOKEN"
+[[ ! -f "$CURL_ARGV_LOG" ]]; check "F6: expiresAt=now+61000 -> curl NOT invoked (no refresh attempted)" $?
+rm -f "$CURL_ARGV_LOG"
+
 unset OAUTH_HTTP_CODE OAUTH_RESPONSE_BODY
 rm -rf "$RCREDS_DIR"
 unset _CREDS_DIR
@@ -556,6 +585,32 @@ rm -f "$AUTO_CAPTURE_SENTINEL" "${RUNTIME_DIR}/.claude_cred_capture_vetoed_cllte
 maybe_auto_capture
 [[ ! -f "$AUTO_CAPTURE_SENTINEL" ]]; check "mdat -40s (outside window, two-sided): capture NOT invoked" $?
 [[ -f "${RUNTIME_DIR}/.claude_cred_capture_vetoed_clltest" ]]; check "mdat -40s (outside window, two-sided): veto artifact created" $?
+
+# F5: pin the two-sided corroboration window boundary exactly (default
+# window=30s, the veto check is strictly `delta > window`). delta==30
+# (exactly AT the window) -> NOT vetoed, capture proceeds. delta==31 (one
+# second past) -> vetoed. Each case anchors BOTH profileFetchedAt and
+# MDAT_TS off its OWN fresh epoch (not BASE_EPOCH shifted by an unrelated
+# offset — shifting profileFetchedAt without shifting mdat by the exact
+# same amount changes the delta the veto check actually sees) so
+# mdat_epoch - profile_fetched_sec lands on exactly 30 / 31, while still
+# giving each case a profileFetchedAt the probe-storm guard has never
+# seen before.
+F5_EPOCH_30=$((BASE_EPOCH + 10000))
+export MDAT_TS=$(epoch_to_mdat_ts $((F5_EPOCH_30 + 30)))
+echo "{\"oauthAccount\":{\"accountUuid\":\"acct-1\",\"profileFetchedAt\":$((F5_EPOCH_30 * 1000))}}" > "$_CREDS_DIR/.claude.json"
+rm -f "$AUTO_CAPTURE_SENTINEL" "${RUNTIME_DIR}/.claude_cred_capture_vetoed_clltest"
+maybe_auto_capture
+[[ -f "$AUTO_CAPTURE_SENTINEL" ]]; check "F5: delta==30 (exactly at window) -> capture proceeds, NOT vetoed" $?
+[[ ! -f "${RUNTIME_DIR}/.claude_cred_capture_vetoed_clltest" ]]; check "F5: delta==30 -> no veto artifact" $?
+
+F5_EPOCH_31=$((BASE_EPOCH + 20000))
+export MDAT_TS=$(epoch_to_mdat_ts $((F5_EPOCH_31 + 31)))
+echo "{\"oauthAccount\":{\"accountUuid\":\"acct-1\",\"profileFetchedAt\":$((F5_EPOCH_31 * 1000))}}" > "$_CREDS_DIR/.claude.json"
+rm -f "$AUTO_CAPTURE_SENTINEL" "${RUNTIME_DIR}/.claude_cred_capture_vetoed_clltest"
+maybe_auto_capture
+[[ ! -f "$AUTO_CAPTURE_SENTINEL" ]]; check "F5: delta==31 (one past window) -> capture NOT invoked (vetoed)" $?
+[[ -f "${RUNTIME_DIR}/.claude_cred_capture_vetoed_clltest" ]]; check "F5: delta==31 -> veto artifact created" $?
 
 # Probe-storm guard: a SECOND invocation with the SAME (unchanged)
 # profileFetchedAt as the immediately-preceding veto must perform NO
@@ -898,6 +953,103 @@ assert_eq "lock_held e2e: cache untouched (still token_source=file)" "$before_lo
 
 rmdir "${RUNTIME_DIR}/.claude_cred_lock_personal" 2>/dev/null
 rm -f /tmp/.cll_lockheld_stderr
+
+# F1: full happy-path e2e — expired file token + 200 refresh + 200 usage
+# fetch -> final cache has FRESH numbers, token_source=file, and the
+# credentials file is rotated on disk. A real end-to-end run (not the
+# isolated refresh_token_grant unit tests in the "refresh_token_grant"
+# area above, which never invoke the hook's main()/fetch_usage/cache-
+# write path).
+F1CURL=$(mktemp -d)
+cat > "$F1CURL/curl" <<'EOF'
+#!/bin/bash
+url=""
+for arg in "$@"; do
+  [[ "$arg" == http* ]] && url="$arg"
+done
+if [[ "$url" == *"/v1/oauth/token"* ]]; then
+  cat >/dev/null
+  printf '%s\n%s' '{"access_token":"tok_fake_f1_new","refresh_token":"rtok_fake_f1_new","expires_in":3600}' "200"
+elif [[ "$url" == *"/api/oauth/usage"* ]]; then
+  printf '%s' '{"five_hour":{"utilization":33},"seven_day":{"utilization":12}}'
+fi
+EOF
+chmod +x "$F1CURL/curl"
+
+rm -f "${RUNTIME_DIR}/.claude_usage_limits_personal.json" "${RUNTIME_DIR}/.claude_cred_refresh_failed_personal"
+rmdir "${RUNTIME_DIR}/.claude_cred_lock_personal" 2>/dev/null
+cat > "$E2E_CREDS_DIR/.credentials.json" <<EOF
+{"claudeAiOauth":{"accessToken":"tok_fake_f1_old","refreshToken":"rtok_fake_f1_old","expiresAt":$past_ms,"refreshTokenExpiresAt":$((past_ms + 999999999))}}
+EOF
+rm -f "$E2E_CREDS_DIR/.credentials.json.bak"
+
+CLAUDE_CONFIG_DIR="$E2E_CREDS_DIR" PATH="$F1CURL:$PATH" bash "$HOOK" </dev/null >/dev/null 2>/tmp/.cll_f1_stderr
+
+assert_eq "F1 e2e: final cache token_source=file" "file" "$(jq -r '.token_source' "${RUNTIME_DIR}/.claude_usage_limits_personal.json" 2>/dev/null)"
+assert_eq "F1 e2e: final cache has FRESH five_hour utilization" "33" "$(jq -r '.five_hour.utilization' "${RUNTIME_DIR}/.claude_usage_limits_personal.json" 2>/dev/null)"
+assert_eq "F1 e2e: final cache has FRESH seven_day utilization" "12" "$(jq -r '.seven_day.utilization' "${RUNTIME_DIR}/.claude_usage_limits_personal.json" 2>/dev/null)"
+assert_eq "F1 e2e: credentials file rotated on disk (new accessToken)" "tok_fake_f1_new" "$(jq -r '.claudeAiOauth.accessToken' "$E2E_CREDS_DIR/.credentials.json" 2>/dev/null)"
+assert_eq "F1 e2e: credentials file rotated on disk (new refreshToken)" "rtok_fake_f1_new" "$(jq -r '.claudeAiOauth.refreshToken' "$E2E_CREDS_DIR/.credentials.json" 2>/dev/null)"
+[[ ! -f "$E2E_CREDS_DIR/.credentials.json.bak" ]]; check "F1 e2e: .bak deleted after verified-successful rotation" $?
+
+rm -f "${RUNTIME_DIR}/.claude_usage_limits_personal.json" /tmp/.cll_f1_stderr
+rm -rf "$F1CURL"
+
+# F2: no_refresh_token (creds file's refreshToken is an EXPLICIT empty
+# string, not missing/null) -> refresh_token_grant fails BEFORE any
+# network call; main() routes it through handle_refresh_failure exactly
+# like an HTTP failure -> artifact carries the reason string, and the
+# credentials file itself stays byte-unchanged (no .bak was ever written
+# — the -z refresh_token check returns before that point).
+rm -f "${RUNTIME_DIR}/.claude_usage_limits_personal.json" "${RUNTIME_DIR}/.claude_cred_refresh_failed_personal"
+rm -f "$E2E_CREDS_DIR/.credentials.json.bak"
+cat > "$E2E_CREDS_DIR/.credentials.json" <<EOF
+{"claudeAiOauth":{"accessToken":"tok_fake_norefresh","refreshToken":"","expiresAt":$past_ms,"refreshTokenExpiresAt":$((past_ms + 999999999))}}
+EOF
+before_f2a_creds=$(cat "$E2E_CREDS_DIR/.credentials.json")
+
+CLAUDE_CONFIG_DIR="$E2E_CREDS_DIR" PATH="$E2ECURL:$PATH" bash "$HOOK" </dev/null >/dev/null 2>/tmp/.cll_f2a_stderr
+
+assert_eq "F2 no_refresh_token: credentials file unchanged" "$before_f2a_creds" "$(cat "$E2E_CREDS_DIR/.credentials.json")"
+[[ ! -f "$E2E_CREDS_DIR/.credentials.json.bak" ]]; check "F2 no_refresh_token: no .bak created (fails before any write)" $?
+[[ -f "${RUNTIME_DIR}/.claude_cred_refresh_failed_personal" ]]; check "F2 no_refresh_token: refresh-failed artifact created" $?
+grep -q "no_refresh_token" "${RUNTIME_DIR}/.claude_cred_refresh_failed_personal"
+check "F2 no_refresh_token: artifact text names the reason" $?
+
+rm -f "${RUNTIME_DIR}/.claude_cred_refresh_failed_personal" /tmp/.cll_f2a_stderr
+
+# F2: parse_failure (200 response body missing expires_in) -> same
+# artifact/credentials-file-untouched contract as an HTTP failure. A
+# .bak DOES get written here (refresh_token_grant creates it before the
+# POST, same as the 500 e2e case above covers) — what must stay
+# untouched is the MAIN credentials file, since no rotation ever
+# completes on a parse failure.
+F2BCURL=$(mktemp -d)
+cat > "$F2BCURL/curl" <<'EOF'
+#!/bin/bash
+url=""
+for arg in "$@"; do
+  [[ "$arg" == http* ]] && url="$arg"
+done
+[[ "$url" == *"/v1/oauth/token"* ]] && { cat >/dev/null; printf '%s\n%s' '{"access_token":"tok_no_expiry"}' "200"; }
+EOF
+chmod +x "$F2BCURL/curl"
+
+rm -f "${RUNTIME_DIR}/.claude_cred_refresh_failed_personal" "$E2E_CREDS_DIR/.credentials.json.bak"
+cat > "$E2E_CREDS_DIR/.credentials.json" <<EOF
+{"claudeAiOauth":{"accessToken":"tok_fake_parsefail","refreshToken":"rtok_fake_parsefail","expiresAt":$past_ms,"refreshTokenExpiresAt":$((past_ms + 999999999))}}
+EOF
+before_f2b_creds=$(cat "$E2E_CREDS_DIR/.credentials.json")
+
+CLAUDE_CONFIG_DIR="$E2E_CREDS_DIR" PATH="$F2BCURL:$PATH" bash "$HOOK" </dev/null >/dev/null 2>/tmp/.cll_f2b_stderr
+
+assert_eq "F2 parse_failure: credentials file unchanged" "$before_f2b_creds" "$(cat "$E2E_CREDS_DIR/.credentials.json")"
+[[ -f "${RUNTIME_DIR}/.claude_cred_refresh_failed_personal" ]]; check "F2 parse_failure: refresh-failed artifact created" $?
+grep -q "parse_failure" "${RUNTIME_DIR}/.claude_cred_refresh_failed_personal"
+check "F2 parse_failure: artifact text names the reason" $?
+
+rm -f "${RUNTIME_DIR}/.claude_cred_refresh_failed_personal" "$E2E_CREDS_DIR/.credentials.json.bak" /tmp/.cll_f2b_stderr
+rm -rf "$F2BCURL"
 
 rm -rf "$E2E_DIR" "$E2ECURL" "$CURLSTUB2"
 rm -f "${RUNTIME_DIR}/.claude_usage_limits_personal.json" "${RUNTIME_DIR}/.claude_cred_refresh_failed_personal" /tmp/.cll_e2e_stderr
