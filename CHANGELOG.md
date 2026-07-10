@@ -3,6 +3,11 @@
 All notable changes to this project follow [Semantic Versioning](https://semver.org).
 Each release corresponds to a `vMAJOR.MINOR.PATCH` git tag.
 
+## v0.6.1 (2026-07-10)
+
+### Fixes
+- **Identity probe response shape**: Captures always landed unverified — the `?` marker never cleared — because `capture-profile-session.sh`'s identity probe parsed `/api/oauth/profile`'s response as flat top-level `uuid`/`email` fields. Verified against the live endpoint, the real shape nests both under `account`: `{account: {uuid, email, ...}, organization: {...}, application: {...}}`. The parse now reads `.account.uuid` / `.account.email` first, with the old flat fields kept as harmless fallbacks.
+
 ## v0.6.0 (2026-07-10)
 
 ### Fixes
