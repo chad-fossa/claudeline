@@ -50,7 +50,7 @@ Three components, one cache file per account.
 | File | Role |
 |------|------|
 | `statusline-command.sh` | Renders the statusline every prompt. Reads context from Claude's JSON input (uses pre-calculated `used_percentage` when available), usage from cache. |
-| `hooks/show-usage-limits.sh` | Fetches usage from Anthropic's API at session start and after compaction. Writes to `/tmp/.claude_usage_limits_<account>.json`. |
+| `hooks/show-usage-limits.sh` | Fetches usage from Anthropic's API at session start and after compaction. Writes to `/tmp/claudeline-<uid>/.claude_usage_limits_<account>.json` (per-user 0700 dir). |
 | `skills/usage/SKILL.md` | Adds a `/usage` slash command to refresh on demand. |
 | `scripts/capture-profile-session.sh` | Copies the Keychain session into this profile's own credentials file, identity-verified. Auto-invoked by the hook after `/login` (macOS) — see [Per-profile credentials](#per-profile-credentials-macos). |
 
@@ -115,9 +115,9 @@ macOS Keychain has only one slot for the Claude Max OAuth token (`Claude Code-cr
 
 Here's what happens behind the scenes: `hooks/show-usage-limits.sh` notices this profile's `.claude.json` got a fresh login (its `oauthAccount.profileFetchedAt` changed) and hands off to `scripts/capture-profile-session.sh`, which copies the Keychain session into that profile's own `$CLAUDE_CONFIG_DIR/.credentials.json` — but only after verifying with Anthropic's account-profile endpoint that the token it's about to capture actually belongs to this profile's account. A verified capture is stamped `claudeline.verified_account_uuid`; from then on the hook reads that file first and refreshes it itself when the token expires, so logins become rare — claudeline owns the OAuth refresh for that file rather than relying on Keychain.
 
-A capture only proceeds when the login and the Keychain write happen close together (within 30s by default, `CLAUDELINE_CAPTURE_WINDOW_SECS` to adjust); outside that window claudeline vetoes the capture rather than risk grabbing the wrong profile's fresh login, and drops `/tmp/.claude_cred_capture_vetoed_<account>`. The identity probe can also veto a capture outright if the token turns out to belong to a different account than expected — same artifact, no file written either way.
+A capture only proceeds when the login and the Keychain write happen close together (within 30s by default, `CLAUDELINE_CAPTURE_WINDOW_SECS` to adjust); outside that window claudeline vetoes the capture rather than risk grabbing the wrong profile's fresh login, and drops `/tmp/claudeline-<uid>/.claude_cred_capture_vetoed_<account>`. The identity probe can also veto a capture outright if the token turns out to belong to a different account than expected — same artifact, no file written either way.
 
-If claudeline's owned refresh ever fails (upstream token/grant shape changes, network issues), it never falls back to the shared Keychain slot silently — it renders a `!` marker instead (see the table below) and drops a loud artifact at `/tmp/.claude_cred_refresh_failed_<account>`.
+If claudeline's owned refresh ever fails (upstream token/grant shape changes, network issues), it never falls back to the shared Keychain slot silently — it renders a `!` marker instead (see the table below) and drops a loud artifact at `/tmp/claudeline-<uid>/.claude_cred_refresh_failed_<account>`.
 
 ### Manual capture (troubleshooting / recovery)
 
@@ -137,10 +137,10 @@ claudeline can't fully close the shared-keychain-slot issue above on its own, bu
 |--------|---------|
 | Dim `=` after the account label (e.g. `[P]=`) | Both profiles are logged into the *same* account. |
 | Dim `?` after the usage segment (macOS only) | This profile's credentials aren't a VERIFIED per-profile capture (no file, an unverified capture, or a verified-uuid mismatch) — the usage numbers shown may belong to the wrong profile, treat them as unverified. Retires only after one verified capture: `/login` for this profile while online (needs a Claude Code build that writes `profileFetchedAt`, or run [manual capture](#manual-capture-troubleshooting--recovery) directly). Provenance is computed once when the usage cache is written (session start / `/usage` / background refresh, at most every 300s), not on every render, so a just-completed verified capture can lag up to that TTL before `?` clears. |
-| Dim/red `!` after the usage segment | This profile's `.credentials.json` exists but claudeline's owned refresh failed — numbers are stale and the token could not be renewed. Check `/tmp/.claude_cred_refresh_failed_<account>`. |
+| Dim/red `!` after the usage segment | This profile's `.credentials.json` exists but claudeline's owned refresh failed — numbers are stale and the token could not be renewed. Check `/tmp/claudeline-<uid>/.claude_cred_refresh_failed_<account>`. |
 | Account label itself dimmed (e.g. `[W]`) | The account was assumed (`CLAUDE_CONFIG_DIR` unset) rather than explicitly detected. |
 
-A capture that gets vetoed (identity mismatch, or login/Keychain timing outside the corroboration window) never writes a file — it drops `/tmp/.claude_cred_capture_vetoed_<account>` instead, and `?` stays exactly as before the login attempt.
+A capture that gets vetoed (identity mismatch, or login/Keychain timing outside the corroboration window) never writes a file — it drops `/tmp/claudeline-<uid>/.claude_cred_capture_vetoed_<account>` instead, and `?` stays exactly as before the login attempt.
 
 ### Customizing account labels
 

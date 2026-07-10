@@ -1,6 +1,6 @@
 # claudeline — contributor notes
 
-A bash statusline for Claude Code. Runs as `statusLine.command` per session, plus a `SessionStart` hook (`hooks/show-usage-limits.sh`) that fetches usage limits via the Anthropic OAuth API and caches them at `/tmp/.claude_usage_limits_{account}.json`.
+A bash statusline for Claude Code. Runs as `statusLine.command` per session, plus a `SessionStart` hook (`hooks/show-usage-limits.sh`) that fetches usage limits via the Anthropic OAuth API and caches them at `/tmp/claudeline-<uid>/.claude_usage_limits_{account}.json`.
 
 ## Versioning
 
@@ -55,8 +55,8 @@ bash hooks/show-usage-limits.sh
 CLAUDE_CONFIG_DIR=$HOME/.claude-personal bash hooks/show-usage-limits.sh
 
 # Inspect the cache
-cat /tmp/.claude_usage_limits_work.json
-cat /tmp/.claude_usage_limits_personal.json
+cat /tmp/claudeline-<uid>/.claude_usage_limits_work.json
+cat /tmp/claudeline-<uid>/.claude_usage_limits_personal.json
 ```
 
 The cache file is what the statusline reads — if it doesn't exist or is stale, the `5h:X% 7d:X%` segment won't render.

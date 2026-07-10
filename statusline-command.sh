@@ -69,7 +69,10 @@ else
   ACCOUNT_COLOR="${CLAUDE_ACCOUNT_WORK_COLOR:-$CYAN}"
 fi
 
-# Try to get terminal width from shell-written cache, fall back to 80
+# Try to get terminal width from shell-written cache, fall back to 80.
+# /tmp/.terminal_cols is written by the user's own shell config (not
+# claudeline), so it stays at the bare /tmp path it's always used —
+# moving it would break existing dotfile setups that write there.
 if [[ -f /tmp/.terminal_cols ]]; then
   COLS=$(cat /tmp/.terminal_cols 2>/dev/null)
   [[ ! "$COLS" =~ ^[0-9]+$ ]] && COLS=80
@@ -77,13 +80,21 @@ else
   COLS=${COLUMNS:-80}
 fi
 
+# Every cache/lock statusline itself writes lives under the same per-user
+# 0700 runtime dir the hook and capture script use — see
+# hooks/show-usage-limits.sh for the full rationale. Basenames unchanged.
+RUNTIME_DIR="/tmp/claudeline-$(id -u)"
+mkdir -p "$RUNTIME_DIR" 2>/dev/null
+chmod 700 "$RUNTIME_DIR" 2>/dev/null
+readonly RUNTIME_DIR
+
 # ─────────────────────────────────────────────────────────────
 # Usage limits (read from cache populated by SessionStart hook)
 # Cache is also kept warm by background refresh below — the
 # SessionStart hook seeds it, and statusline renders refresh it
 # when it exceeds USAGE_CACHE_TTL_SECONDS.
 # ─────────────────────────────────────────────────────────────
-readonly USAGE_CACHE="/tmp/.claude_usage_limits_${ACCOUNT_ID}.json"
+readonly USAGE_CACHE="${RUNTIME_DIR}/.claude_usage_limits_${ACCOUNT_ID}.json"
 readonly USAGE_CACHE_TTL_SECONDS=300
 
 # Prefer the active profile's own hook; fall back to the work install
@@ -110,7 +121,7 @@ maybe_refresh_usage_cache() {
   cache_mtime=$(file_mtime "$USAGE_CACHE" || echo 0)
   (( now - cache_mtime <= USAGE_CACHE_TTL_SECONDS )) && return
 
-  local lock="/tmp/.claude_usage_refresh_lock_${ACCOUNT_ID}"
+  local lock="${RUNTIME_DIR}/.claude_usage_refresh_lock_${ACCOUNT_ID}"
   if [[ -f "$lock" ]]; then
     local lock_age=$((now - $(file_mtime "$lock" || echo 0)))
     (( lock_age < 30 )) && return
@@ -298,8 +309,8 @@ get_branch() {
 
 get_pr_number() {
   local repo_name=$1 branch=$2
-  local cache="/tmp/.claude_pr_cache_${repo_name}_${ACCOUNT_ID}"
-  local branch_cache="/tmp/.claude_pr_branch_${repo_name}_${ACCOUNT_ID}"
+  local cache="${RUNTIME_DIR}/.claude_pr_cache_${repo_name}_${ACCOUNT_ID}"
+  local branch_cache="${RUNTIME_DIR}/.claude_pr_branch_${repo_name}_${ACCOUNT_ID}"
 
   # Check cache
   if [[ -f "$cache" && -f "$branch_cache" ]]; then
@@ -313,7 +324,7 @@ get_pr_number() {
   fi
 
   # Fetch PR — skip if another fetch is already in flight
-  local lock="/tmp/.claude_pr_lock_${repo_name}_${ACCOUNT_ID}"
+  local lock="${RUNTIME_DIR}/.claude_pr_lock_${repo_name}_${ACCOUNT_ID}"
   # Expire stale locks older than 10 seconds (crash guard)
   if [[ -f "$lock" ]]; then
     local lock_age

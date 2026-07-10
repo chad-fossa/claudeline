@@ -24,7 +24,22 @@ if [[ "$_ACCT_ID" == "personal" ]]; then
 else
   _CREDS_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 fi
-readonly CACHE_FILE="/tmp/.claude_usage_limits_${_ACCT_ID}.json"
+
+# Every artifact/lock/sentinel this hook writes lives under a per-user,
+# 0700 runtime dir instead of bare /tmp — /tmp is world-writable and
+# shared across every user on the box, so a bare filename there is
+# susceptible to a symlink/pre-creation squat from another user. Created
+# here, at this hook's first touch of it, with mkdir -p + an explicit
+# chmod 700 (mkdir's mode arg is subject to umask, so the chmod isn't
+# redundant). Basenames are unchanged — only the parent directory moved.
+# scripts/capture-profile-session.sh inlines this identically (standalone
+# script); scripts/test.sh asserts the two copies match.
+RUNTIME_DIR="/tmp/claudeline-$(id -u)"
+mkdir -p "$RUNTIME_DIR" 2>/dev/null
+chmod 700 "$RUNTIME_DIR" 2>/dev/null
+readonly RUNTIME_DIR
+
+readonly CACHE_FILE="${RUNTIME_DIR}/.claude_usage_limits_${_ACCT_ID}.json"
 
 # Colors (for the one-time display)
 readonly RESET=$'\033[0m'
@@ -48,68 +63,84 @@ fi
 # Sets globals TOKEN and TOKEN_SOURCE (file | file-refresh-failed | keychain |
 # unknown) instead of echoing — a caller wrapping this in $(...) would lose
 # TOKEN_SOURCE to the command-substitution subshell.
+# Guard-clause structure (≤2 nesting levels): each disqualifying
+# condition returns/falls through immediately rather than nesting the
+# whole rest of the function inside progressively deeper ifs.
 get_token() {
   TOKEN=""
   TOKEN_SOURCE="unknown"
   local creds_file="${_CREDS_DIR}/.credentials.json"
 
-  if [[ -f "$creds_file" ]]; then
-    local access_token
-    access_token=$(jq -r '.claudeAiOauth.accessToken // empty' "$creds_file" 2>/dev/null)
-
-    if [[ -n "$access_token" ]]; then
-      local expires_at refresh_expires_at now_ms
-      expires_at=$(jq -r '.claudeAiOauth.expiresAt // empty' "$creds_file" 2>/dev/null)
-      refresh_expires_at=$(jq -r '.claudeAiOauth.refreshTokenExpiresAt // empty' "$creds_file" 2>/dev/null)
-      now_ms=$(( $(date +%s) * 1000 ))
-
-      if [[ -n "$expires_at" && "$expires_at" -gt $((now_ms + 60000)) ]]; then
-        TOKEN_SOURCE="file"
-        TOKEN="$access_token"
-        return 0
-      fi
-
-      if [[ -n "$refresh_expires_at" && "$refresh_expires_at" -lt "$now_ms" ]]; then
-        TOKEN_SOURCE="file-refresh-failed"
-        REFRESH_FAIL_REASON="refresh_token_expired"
-        return 1
-      fi
-
-      if refresh_token_grant; then
-        TOKEN_SOURCE="file"
-        TOKEN=$(jq -r '.claudeAiOauth.accessToken // empty' "$creds_file" 2>/dev/null)
-        return 0
-      fi
-
-      # lock_held means a sibling render is already refreshing this same
-      # account — that sibling's result stands, so this is a benign silent
-      # skip, never a failure: no file-refresh-failed token_source (which
-      # would trip handle_refresh_failure's artifact/cache-mutation/`!`).
-      if [[ "$REFRESH_FAIL_REASON" == "lock_held" ]]; then
-        TOKEN_SOURCE="lock_held"
-        return 1
-      fi
-
-      TOKEN_SOURCE="file-refresh-failed"
-      return 1
-    fi
+  if [[ ! -f "$creds_file" ]]; then
+    fetch_token_from_keychain
+    return $?
   fi
 
-  if [[ "$OSTYPE" == "darwin"* ]]; then
-    # The Claude Max OAuth token lives in "Claude Code-credentials" regardless of
-    # CLAUDE_CONFIG_DIR — keychain isn't isolated per config dir, last /login wins.
-    # Hashed entries (Claude Code-credentials-{hash}) only hold MCP tokens with
-    # empty accessToken fields, not the Max claudeAiOauth we need.
-    # jq can fail on MCP-bloated entries truncated at keychain's output limit, so use grep.
-    TOKEN_SOURCE="keychain"
-    local creds
-    creds=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null) || return 1
-    TOKEN=$(echo "$creds" | grep -o '"claudeAiOauth":{"accessToken":"[^"]*"' \
-      | head -1 \
-      | sed 's/"claudeAiOauth":{"accessToken":"//;s/"$//')
-  else
+  local access_token
+  access_token=$(jq -r '.claudeAiOauth.accessToken // empty' "$creds_file" 2>/dev/null)
+
+  # File present but no usable token (empty file, malformed JSON, or
+  # valid JSON missing the field) — distinct from the silent absent-file
+  # case above: this gets one loud diagnostic + artifact before falling
+  # back to Keychain, since an existing-but-broken credentials file is
+  # itself worth knowing about.
+  if [[ -z "$access_token" ]]; then
+    echo "${DIM}Usage: ${creds_file} exists but has no usable OAuth token (empty or malformed) — falling back to Keychain${RESET}" >&2
+    printf '%s malformed_or_empty_credentials\n' "$(date +%s)" > "${RUNTIME_DIR}/.claude_cred_malformed_${ACCOUNT_ID}"
+    fetch_token_from_keychain
+    return $?
+  fi
+
+  local expires_at refresh_expires_at now_ms
+  expires_at=$(jq -r '.claudeAiOauth.expiresAt // empty' "$creds_file" 2>/dev/null)
+  refresh_expires_at=$(jq -r '.claudeAiOauth.refreshTokenExpiresAt // empty' "$creds_file" 2>/dev/null)
+  now_ms=$(( $(date +%s) * 1000 ))
+
+  if [[ -n "$expires_at" && "$expires_at" -gt $((now_ms + 60000)) ]]; then
+    TOKEN_SOURCE="file"
+    TOKEN="$access_token"
+    return 0
+  fi
+
+  if [[ -n "$refresh_expires_at" && "$refresh_expires_at" -lt "$now_ms" ]]; then
+    TOKEN_SOURCE="file-refresh-failed"
+    REFRESH_FAIL_REASON="refresh_token_expired"
     return 1
   fi
+
+  if refresh_token_grant; then
+    TOKEN_SOURCE="file"
+    TOKEN=$(jq -r '.claudeAiOauth.accessToken // empty' "$creds_file" 2>/dev/null)
+    return 0
+  fi
+
+  # lock_held means a sibling render is already refreshing this same
+  # account — that sibling's result stands, so this is a benign silent
+  # skip, never a failure: no file-refresh-failed token_source (which
+  # would trip handle_refresh_failure's artifact/cache-mutation/`!`).
+  if [[ "$REFRESH_FAIL_REASON" == "lock_held" ]]; then
+    TOKEN_SOURCE="lock_held"
+    return 1
+  fi
+
+  TOKEN_SOURCE="file-refresh-failed"
+  return 1
+}
+
+# The Claude Max OAuth token lives in "Claude Code-credentials" regardless of
+# CLAUDE_CONFIG_DIR — keychain isn't isolated per config dir, last /login wins.
+# Hashed entries (Claude Code-credentials-{hash}) only hold MCP tokens with
+# empty accessToken fields, not the Max claudeAiOauth we need.
+# jq can fail on MCP-bloated entries truncated at keychain's output limit, so use grep.
+fetch_token_from_keychain() {
+  [[ "$OSTYPE" != "darwin"* ]] && return 1
+
+  TOKEN_SOURCE="keychain"
+  local creds
+  creds=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null) || return 1
+  TOKEN=$(echo "$creds" | grep -o '"claudeAiOauth":{"accessToken":"[^"]*"' \
+    | head -1 \
+    | sed 's/"claudeAiOauth":{"accessToken":"//;s/"$//')
 }
 
 # Single source for the cred lock path — used by refresh_token_grant AND
@@ -117,7 +148,7 @@ get_token() {
 # same three lock functions verbatim (standalone script, can't source this
 # file); scripts/test.sh asserts the two copies stay byte-identical.
 cred_lock_dir() {
-  printf '/tmp/.claude_cred_lock_%s' "$ACCOUNT_ID"
+  printf '%s/.claude_cred_lock_%s' "$RUNTIME_DIR" "$ACCOUNT_ID"
 }
 
 # Acquires the cred lock, reclaiming a stale lock dir first (age > 120s —
@@ -166,6 +197,7 @@ release_cred_lock() {
 # Sets REFRESH_FAIL_REASON on failure. Never falls back to Keychain.
 refresh_token_grant() {
   REFRESH_FAIL_REASON=""
+  REFRESH_FAIL_BODY=""
   local creds_file="${_CREDS_DIR}/.credentials.json"
 
   if [[ "$ACCOUNT_ASSUMED" == "1" ]]; then
@@ -189,21 +221,35 @@ refresh_token_grant() {
     return 1
   fi
 
-  cp "$creds_file" "${creds_file}.bak"
+  # .bak exists only to cover the write-failure window between here and a
+  # verified-successful mv below — chmod 600 explicitly (cp doesn't
+  # guarantee the mode of an existing source survives, and this file
+  # holds a live refresh token) and delete it once the new file is
+  # safely in place.
+  local bak_file="${creds_file}.bak"
+  cp "$creds_file" "$bak_file"
+  chmod 600 "$bak_file"
 
+  # --data @- (body piped via stdin) instead of -d "$body": a -d/-H value
+  # is visible in this process's argv (e.g. to `ps`) for as long as curl
+  # runs. The refresh token is IN this body, so it never goes on argv.
   local body response http_code payload
   body=$(jq -n --arg rt "$refresh_token" --arg cid "$client_id" --arg scope "$scopes" \
     '{grant_type: "refresh_token", refresh_token: $rt, client_id: $cid, scope: $scope}')
 
-  response=$(curl -s -w '\n%{http_code}' --max-time 5 \
+  response=$(printf '%s' "$body" | curl -s -w '\n%{http_code}' --max-time 5 \
     -X POST "https://platform.claude.com/v1/oauth/token" \
     -H "Content-Type: application/json" \
-    -d "$body" 2>/dev/null)
+    --data @- 2>/dev/null)
   http_code="${response##*$'\n'}"
   payload="${response%$'\n'*}"
 
   if [[ "$http_code" != "200" ]] || ! echo "$payload" | jq -e . >/dev/null 2>&1; then
     REFRESH_FAIL_REASON="http_${http_code:-timeout}"
+    # error/error_description only — an OAuth error body never carries a
+    # token, but extracting just these two fields (rather than logging
+    # $payload raw) keeps that guarantee explicit rather than assumed.
+    REFRESH_FAIL_BODY=$(echo "$payload" | jq -r '[(.error // ""), (.error_description // "")] | join(" ")' 2>/dev/null)
     release_cred_lock
     return 1
   fi
@@ -215,6 +261,7 @@ refresh_token_grant() {
 
   if [[ -z "$access_token" || -z "$expires_in" ]]; then
     REFRESH_FAIL_REASON="parse_failure"
+    REFRESH_FAIL_BODY=$(echo "$payload" | jq -r '[(.error // ""), (.error_description // "")] | join(" ")' 2>/dev/null)
     release_cred_lock
     return 1
   fi
@@ -223,12 +270,20 @@ refresh_token_grant() {
   now_ms=$(( $(date +%s) * 1000 ))
   new_expires_at=$(( now_ms + expires_in * 1000 ))
 
+  # umask 077 for the window between jq's write and chmod: without it,
+  # the tmp file briefly exists at the process's default (often
+  # world-readable) mode before chmod 600 catches up — this closes that
+  # window instead of narrowing it after the fact.
   local tmp_file="${creds_file}.tmp"
-  jq --arg at "$access_token" --arg rt "$new_refresh_token" --argjson exp "$new_expires_at" \
-    '.claudeAiOauth.accessToken = $at | .claudeAiOauth.refreshToken = $rt | .claudeAiOauth.expiresAt = $exp' \
-    "$creds_file" > "$tmp_file"
+  (
+    umask 077
+    jq --arg at "$access_token" --arg rt "$new_refresh_token" --argjson exp "$new_expires_at" \
+      '.claudeAiOauth.accessToken = $at | .claudeAiOauth.refreshToken = $rt | .claudeAiOauth.expiresAt = $exp' \
+      "$creds_file" > "$tmp_file"
+  )
   chmod 600 "$tmp_file"
   mv "$tmp_file" "$creds_file"
+  rm -f "$bak_file"
 
   release_cred_lock
   return 0
@@ -313,7 +368,7 @@ resolve_capture_script() {
 # profileFetchedAt value) doesn't match the sentinel, so it naturally
 # re-arms.
 auto_capture_sentinel() {
-  printf '/tmp/.claude_cred_capture_attempted_%s' "$ACCOUNT_ID"
+  printf '%s/.claude_cred_capture_attempted_%s' "$RUNTIME_DIR" "$ACCOUNT_ID"
 }
 
 record_capture_attempt() {
@@ -382,7 +437,7 @@ maybe_auto_capture() {
   cap_email=$(jq -r '.oauthAccount.emailAddress // .oauthAccount.email // "unknown"' "$claude_json" 2>/dev/null)
 
   if ((delta > window)); then
-    local artifact="/tmp/.claude_cred_capture_vetoed_${ACCOUNT_ID}"
+    local artifact="${RUNTIME_DIR}/.claude_cred_capture_vetoed_${ACCOUNT_ID}"
     printf '%s auto_capture_veto reason=timing_window delta=%ss window=%ss profileFetchedAt=%s mdat=%s uuid=%s email=%s\n' \
       "$(date +%s)" "$delta" "$window" "$profile_fetched_at" "$mdat_epoch" "$cap_uuid" "$cap_email" > "$artifact"
     echo "${DIM}Usage: auto-capture vetoed for ${cap_email} (${cap_uuid}) — keychain/login timing outside ${window}s window (delta=${delta}s)${RESET}" >&2
@@ -411,12 +466,24 @@ maybe_auto_capture() {
 # Fetch usage limits from API
 fetch_usage() {
   local token=$1
+  # Bearer header via -H @<600-tmp-file> instead of -H "Authorization:
+  # Bearer $token" — a -H value is visible in this process's argv (e.g.
+  # to `ps`) for as long as curl runs; a file curl reads isn't. Header
+  # file is chmod 600 before curl ever opens it, and removed immediately
+  # after curl exits regardless of outcome.
+  local header_file
+  header_file=$(mktemp)
+  chmod 600 "$header_file"
+  printf 'Authorization: Bearer %s\n' "$token" > "$header_file"
+
   curl -s --max-time 5 "https://api.anthropic.com/api/oauth/usage" \
     -H "Accept: application/json" \
     -H "Content-Type: application/json" \
     -H "User-Agent: claude-code/2.0.32" \
-    -H "Authorization: Bearer ${token}" \
+    -H @"$header_file" \
     -H "anthropic-beta: oauth-2025-04-20"
+
+  rm -f "$header_file"
 }
 
 # Format utilization with color (util is already a percentage, e.g., 15.0 = 15%)
@@ -466,8 +533,14 @@ mini_bar() {
 # as today's no-cache-yet behavior.
 handle_refresh_failure() {
   local reason="${REFRESH_FAIL_REASON:-unknown}"
-  local artifact="/tmp/.claude_cred_refresh_failed_${ACCOUNT_ID}"
+  local artifact="${RUNTIME_DIR}/.claude_cred_refresh_failed_${ACCOUNT_ID}"
+  # REFRESH_FAIL_BODY (error/error_description only — see
+  # refresh_token_grant) is set on an HTTP-failure or parse-failure
+  # refresh; other failure reasons (lock_held never reaches here,
+  # account_assumed, no_refresh_token, refresh_token_expired) never got a
+  # server response to report.
   printf '%s %s\n' "$(date +%s)" "$reason" > "$artifact"
+  [[ -n "${REFRESH_FAIL_BODY:-}" ]] && printf '%s\n' "$REFRESH_FAIL_BODY" >> "$artifact"
 
   if [[ -f "$CACHE_FILE" ]]; then
     local merged

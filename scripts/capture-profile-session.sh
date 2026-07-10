@@ -20,12 +20,20 @@ detect_account() {
 }
 detect_account
 
+# Same runtime dir hooks/show-usage-limits.sh uses — inlined here
+# identically (standalone script). See that file for the full rationale
+# (world-writable /tmp squat/symlink surface).
+RUNTIME_DIR="/tmp/claudeline-$(id -u)"
+mkdir -p "$RUNTIME_DIR" 2>/dev/null
+chmod 700 "$RUNTIME_DIR" 2>/dev/null
+readonly RUNTIME_DIR
+
 # Same lock hooks/show-usage-limits.sh uses for refresh_token_grant and
 # maybe_auto_capture — inlined here byte-identically (standalone script,
 # can't source the hook) so manual capture can't race an in-flight
 # refresh. scripts/test.sh asserts the two copies stay in sync.
 cred_lock_dir() {
-  printf '/tmp/.claude_cred_lock_%s' "$ACCOUNT_ID"
+  printf '%s/.claude_cred_lock_%s' "$RUNTIME_DIR" "$ACCOUNT_ID"
 }
 
 acquire_cred_lock() {
@@ -117,11 +125,20 @@ verify_capture_identity() {
   PROBE_UUID=""
   PROBE_EMAIL=""
 
+  # Bearer header via -H @<600-tmp-file>, same reasoning as
+  # hooks/show-usage-limits.sh's fetch_usage — a -H value is visible on
+  # this process's argv for as long as curl runs; a file curl reads isn't.
+  local header_file
+  header_file=$(mktemp)
+  chmod 600 "$header_file"
+  printf 'Authorization: Bearer %s\n' "$token" > "$header_file"
+
   local response http_code payload
   response=$(curl -s -w '\n%{http_code}' --max-time 5 \
-    -H "Authorization: Bearer ${token}" \
+    -H @"$header_file" \
     -H "Content-Type: application/json" \
     "https://api.anthropic.com/api/oauth/profile" 2>/dev/null)
+  rm -f "$header_file"
   http_code="${response##*$'\n'}"
   payload="${response%$'\n'*}"
 
@@ -143,7 +160,7 @@ access_token=$(echo "$oauth_blob" | jq -r '.accessToken // empty')
 verify_capture_identity "$access_token" "$uuid"
 
 if [[ "$VERIFY_STATUS" == "mismatch" ]]; then
-  artifact="/tmp/.claude_cred_capture_vetoed_${ACCOUNT_ID}"
+  artifact="${RUNTIME_DIR}/.claude_cred_capture_vetoed_${ACCOUNT_ID}"
   printf '%s reason=identity_mismatch profile_uuid=%s probe_uuid=%s profile_email=%s probe_email=%s\n' \
     "$(date +%s)" "$uuid" "$PROBE_UUID" "$profile_email" "$PROBE_EMAIL" > "$artifact"
   echo "capture VETOED: keychain session belongs to a different account than this profile (profile uuid=${uuid} email=${profile_email}; keychain probe uuid=${PROBE_UUID} email=${PROBE_EMAIL})" >&2
@@ -155,20 +172,29 @@ captured_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 tmp_file="$CONFIG_DIR/.credentials.json.tmp"
 dest_file="$CONFIG_DIR/.credentials.json"
 
+# umask 077 for the window between jq's write and chmod 600 below —
+# without it the tmp file briefly exists at the process's default (often
+# world-readable) mode before chmod catches up.
 if [[ "$VERIFY_STATUS" == "verified" ]]; then
-  jq -n --argjson oauth "$oauth_blob" --arg uuid "$uuid" --arg at "$captured_at" \
-    --arg login_at "$profile_fetched_at" --arg verified_at "$captured_at" \
-    '{claudeAiOauth: $oauth, claudeline: {captured_for_uuid: $uuid, captured_at: $at,
-      captured_login_at: (if $login_at == "" then null else $login_at end),
-      verified_account_uuid: $uuid, verified_at: $verified_at}}' \
-    > "$tmp_file"
+  (
+    umask 077
+    jq -n --argjson oauth "$oauth_blob" --arg uuid "$uuid" --arg at "$captured_at" \
+      --arg login_at "$profile_fetched_at" --arg verified_at "$captured_at" \
+      '{claudeAiOauth: $oauth, claudeline: {captured_for_uuid: $uuid, captured_at: $at,
+        captured_login_at: (if $login_at == "" then null else $login_at end),
+        verified_account_uuid: $uuid, verified_at: $verified_at}}' \
+      > "$tmp_file"
+  )
 else
   echo "capture unverified: identity probe unavailable (timeout/non-200/unparseable) — file usable but ? stays until a verified capture" >&2
-  jq -n --argjson oauth "$oauth_blob" --arg uuid "$uuid" --arg at "$captured_at" \
-    --arg login_at "$profile_fetched_at" \
-    '{claudeAiOauth: $oauth, claudeline: {captured_for_uuid: $uuid, captured_at: $at,
-      captured_login_at: (if $login_at == "" then null else $login_at end)}}' \
-    > "$tmp_file"
+  (
+    umask 077
+    jq -n --argjson oauth "$oauth_blob" --arg uuid "$uuid" --arg at "$captured_at" \
+      --arg login_at "$profile_fetched_at" \
+      '{claudeAiOauth: $oauth, claudeline: {captured_for_uuid: $uuid, captured_at: $at,
+        captured_login_at: (if $login_at == "" then null else $login_at end)}}' \
+      > "$tmp_file"
+  )
 fi
 
 chmod 600 "$tmp_file"
