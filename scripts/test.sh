@@ -438,6 +438,63 @@ OSTYPE="linux-gnu"
 marker=$(unverifiable_marker "differ")
 assert_eq "linux + differ -> no ? marker (darwin-only)" "" "$marker"
 
+OSTYPE="darwin24"
+RED=$'\033[31m'
+
+# token_source-aware suppression: file+matching provenance suppresses ?,
+# file+mismatch keeps it, unknown/keychain behave like v0.5.0, and
+# file-refresh-failed always renders ! regardless of state/provenance.
+marker=$(unverifiable_marker "differ" "file" "0")
+assert_eq "token_source=file + provenance match -> no ? marker" "" "$marker"
+
+marker=$(unverifiable_marker "differ" "file" "1")
+assert_eq "token_source=file + provenance mismatch -> ? stays" " ${DIM}?${RESET}" "$marker"
+
+marker=$(unverifiable_marker "differ" "unknown" "1")
+assert_eq "token_source=unknown -> ? per v0.5.0" " ${DIM}?${RESET}" "$marker"
+
+marker=$(unverifiable_marker "differ" "keychain" "1")
+assert_eq "token_source=keychain -> ? per v0.5.0" " ${DIM}?${RESET}" "$marker"
+
+marker=$(unverifiable_marker "equal" "file-refresh-failed" "1")
+assert_eq "token_source=file-refresh-failed -> ! marker" " ${DIM}${RED}!${RESET}" "$marker"
+
+# ─────────────────────────────────────────────────────────────
+# Area: file_provenance_matches (captured_for_uuid vs profile uuid)
+# ─────────────────────────────────────────────────────────────
+FPM_SRC=$(extract_func "$STATUSLINE" file_provenance_matches)
+eval "$FPM_SRC"
+
+FPM_DIR=$(mktemp -d)
+FPM_PERSONAL="$FPM_DIR/claude-personal"
+mkdir -p "$FPM_PERSONAL"
+
+ACCOUNT_ID="personal"
+CLAUDE_CONFIG_DIR="$FPM_PERSONAL"
+
+echo '{"oauthAccount":{"accountUuid":"uuid-match"}}' > "$FPM_PERSONAL/.claude.json"
+echo '{"claudeAiOauth":{"accessToken":"tok_fake_fpm"},"claudeline":{"captured_for_uuid":"uuid-match"}}' > "$FPM_PERSONAL/.credentials.json"
+file_provenance_matches
+check "file_provenance_matches: matching uuid -> true" $?
+
+echo '{"claudeAiOauth":{"accessToken":"tok_fake_fpm"},"claudeline":{"captured_for_uuid":"uuid-other"}}' > "$FPM_PERSONAL/.credentials.json"
+file_provenance_matches
+result=$?
+[[ "$result" != "0" ]]; check "file_provenance_matches: mismatched uuid -> false" $?
+
+echo '{"claudeAiOauth":{"accessToken":"tok_fake_fpm"}}' > "$FPM_PERSONAL/.credentials.json"
+file_provenance_matches
+result=$?
+[[ "$result" != "0" ]]; check "file_provenance_matches: no claudeline block -> false" $?
+
+rm -f "$FPM_PERSONAL/.credentials.json"
+file_provenance_matches
+result=$?
+[[ "$result" != "0" ]]; check "file_provenance_matches: no credentials file -> false" $?
+
+rm -rf "$FPM_DIR"
+unset ACCOUNT_ID CLAUDE_CONFIG_DIR
+
 # ─────────────────────────────────────────────────────────────
 # Area: profile-aware hook path (resolve_usage_refresh_hook)
 # ─────────────────────────────────────────────────────────────

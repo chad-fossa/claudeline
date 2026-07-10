@@ -162,8 +162,12 @@ get_usage_limits() {
   ((pct7 >= 80)) && color7=$RED
   ((pct7 >= 50 && pct7 < 80)) && color7=$YELLOW
 
+  local token_source prov
+  token_source=$(jq -r '.token_source // "unknown"' "$USAGE_CACHE" 2>/dev/null)
+  if file_provenance_matches; then prov=0; else prov=1; fi
+
   local unverifiable
-  unverifiable=$(unverifiable_marker "$(profile_uuid_state)")
+  unverifiable=$(unverifiable_marker "$(profile_uuid_state)" "$token_source" "$prov")
 
   printf '%s%s:%s%s%d%%%s %s%s:%s%s%d%%%s %s│%s%s' "$DIM" "$label5" "$RESET" "$color5" "$pct5" "$RESET" "$DIM" "$label7" "$RESET" "$color7" "$pct7" "$RESET" "$DIM" "$RESET" "$unverifiable"
 }
@@ -393,8 +397,46 @@ shared_login_marker() {
   [[ "$state" == "equal" ]] && printf '%s=%s' "$DIM" "$RESET"
 }
 
+# True only when this profile's .credentials.json was captured (via
+# scripts/capture-profile-session.sh) FOR this exact profile — i.e. its
+# claudeline.captured_for_uuid matches this profile's .claude.json
+# accountUuid. A file with no claudeline block (hand-captured pre-0.6.0)
+# or a mismatched uuid returns false.
+file_provenance_matches() {
+  local creds_dir
+  if [[ "$ACCOUNT_ID" == "personal" ]]; then
+    creds_dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude-personal}"
+  else
+    creds_dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+  fi
+
+  local creds_file="$creds_dir/.credentials.json"
+  local claude_json="$creds_dir/.claude.json"
+  [[ -f "$creds_file" && -f "$claude_json" ]] || return 1
+
+  local captured_uuid profile_uuid
+  captured_uuid=$(jq -r '.claudeline.captured_for_uuid // empty' "$creds_file" 2>/dev/null)
+  profile_uuid=$(jq -r '.oauthAccount.accountUuid // empty' "$claude_json" 2>/dev/null)
+
+  [[ -n "$captured_uuid" && -n "$profile_uuid" && "$captured_uuid" == "$profile_uuid" ]]
+}
+
+# state: profile_uuid_state() result. token_source/provenance_ok default to
+# pre-0.6.0 values so old 1-arg callers keep today's darwin+differ behavior.
+# file-refresh-failed always wins (stale numbers + broken refresh, distinct
+# from the cross-profile-ambiguity ?). file+matching provenance suppresses
+# ? — anything else (mismatch, unknown, keychain) renders it exactly as
+# v0.5.0 did.
 unverifiable_marker() {
-  local state=$1
+  local state=$1 token_source=${2:-unknown} provenance_ok=${3:-1}
+
+  if [[ "$token_source" == "file-refresh-failed" ]]; then
+    printf ' %s%s!%s' "$DIM" "$RED" "$RESET"
+    return
+  fi
+
+  [[ "$token_source" == "file" && "$provenance_ok" == "0" ]] && return
+
   [[ "$OSTYPE" == darwin* && "$state" == "differ" ]] && printf ' %s?%s' "$DIM" "$RESET"
 }
 
