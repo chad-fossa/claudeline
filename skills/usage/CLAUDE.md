@@ -1,5 +1,5 @@
 # skills/usage
 
-`/usage` skill — re-invokes `../../hooks/show-usage-limits.sh` to refresh the usage cache the statusline reads.
+`/usage` skill — explains that usage limits arrive automatically on the statusline's stdin each render; nothing to force-refresh.
 
 consult-expert: claudeline-core

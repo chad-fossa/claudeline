@@ -26,25 +26,15 @@ case "$(uname)" in
 esac
 
 # Create directories
-mkdir -p "$CLAUDE_DIR/hooks"
 mkdir -p "$CLAUDE_DIR/skills/usage"
-mkdir -p "$CLAUDE_DIR/scripts"
 
 # Download files
 echo "  Downloading statusline-command.sh..."
 curl -fsSL "$REPO/statusline-command.sh" -o "$CLAUDE_DIR/statusline-command.sh"
 chmod +x "$CLAUDE_DIR/statusline-command.sh"
 
-echo "  Downloading show-usage-limits.sh..."
-curl -fsSL "$REPO/hooks/show-usage-limits.sh" -o "$CLAUDE_DIR/hooks/show-usage-limits.sh"
-chmod +x "$CLAUDE_DIR/hooks/show-usage-limits.sh"
-
 echo "  Downloading usage skill..."
 curl -fsSL "$REPO/skills/usage/SKILL.md" -o "$CLAUDE_DIR/skills/usage/SKILL.md"
-
-echo "  Downloading capture-profile-session.sh..."
-curl -fsSL "$REPO/scripts/capture-profile-session.sh" -o "$CLAUDE_DIR/scripts/capture-profile-session.sh"
-chmod +x "$CLAUDE_DIR/scripts/capture-profile-session.sh"
 
 # Merge into settings.json
 SETTINGS="$CLAUDE_DIR/settings.json"
@@ -53,22 +43,12 @@ if [[ -f "$SETTINGS" ]]; then
   cp "$SETTINGS" "$SETTINGS.bak"
   echo "  Backed up existing settings to settings.json.bak"
 
-  # Merge statusLine and hooks into existing settings
+  # Merge statusLine into existing settings
   MERGED=$(jq --arg dir "$CLAUDE_DIR" '
     .statusLine = {
       "type": "command",
       "command": ("bash " + $dir + "/statusline-command.sh")
-    } |
-    .hooks.SessionStart = [
-      {
-        "matcher": "startup",
-        "hooks": [{"type": "command", "command": ($dir + "/hooks/show-usage-limits.sh")}]
-      },
-      {
-        "matcher": "compact",
-        "hooks": [{"type": "command", "command": ($dir + "/hooks/show-usage-limits.sh")}]
-      }
-    ]
+    }
   ' "$SETTINGS")
   echo "$MERGED" > "$SETTINGS"
 else
@@ -78,22 +58,9 @@ else
     "statusLine": {
       "type": "command",
       "command": ("bash " + $dir + "/statusline-command.sh")
-    },
-    "hooks": {
-      "SessionStart": [
-        {
-          "matcher": "startup",
-          "hooks": [{"type": "command", "command": ($dir + "/hooks/show-usage-limits.sh")}]
-        },
-        {
-          "matcher": "compact",
-          "hooks": [{"type": "command", "command": ($dir + "/hooks/show-usage-limits.sh")}]
-        }
-      ]
     }
   }' > "$SETTINGS"
 fi
 
 echo ""
 echo "claudeline installed! Restart Claude Code to see your new statusline."
-echo "Type /usage inside Claude Code to manually refresh usage limits."

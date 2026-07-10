@@ -1,24 +1,18 @@
 ---
 name: usage
-description: Refresh Claude Code usage limits in the statusline. Use when the user runs /usage, wants to check usage, refresh usage stats, or see remaining quota.
+description: Explain how usage limits show up in the statusline. Use when the user asks about /usage, why usage is blank, or how to refresh usage stats.
 ---
 
-# Refresh Usage Limits
+# Usage Limits
 
-Fetches the current 5-hour and 7-day usage limits from Anthropic's API and updates the statusline cache for the active account.
+There's nothing to refresh — Claude Code hands each session its own 5-hour
+and 7-day usage on the statusline's stdin (`rate_limits.five_hour` /
+`.seven_day`) on every render, so the statusline just reads it straight off
+that input. No fetch, no OAuth token, no cache TTL.
 
-## Instructions
+## If the usage segment is blank
 
-Run the usage limits hook script (pipe empty input since it normally receives hook JSON on stdin):
-
-```bash
-echo '{}' | ~/.claude/hooks/show-usage-limits.sh
-```
-
-This will:
-1. Detect the active account from `CLAUDE_CONFIG_DIR`
-2. Fetch current usage from Anthropic's OAuth API
-3. Update the cache at `/tmp/.claude_usage_limits_<account>.json`
-4. Display the current usage percentages
-
-The statusline will reflect the updated values on the next render.
+Usage arrives with the session's first API response. A brand-new session
+(before you've sent a prompt) has no `rate_limits` yet, so the segment is
+blank until then — that's expected, not a bug. Send one prompt and the next
+statusline render will show it.
