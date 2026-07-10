@@ -372,6 +372,109 @@ check "test_stdin_seven_only_renders_and_caches_seven_omits_five: 5h not fabrica
 rm -f "$GUL_CACHE"
 
 # ─────────────────────────────────────────────────────────────
+# Area: security batch — D1 numeric validation, D2 control-byte
+# stripping, D3 RUNTIME_DIR permission bits.
+# ─────────────────────────────────────────────────────────────
+
+# D1: a non-numeric used_percentage must never reach awk/bash
+# arithmetic — treated as absent (never fabricated 0), and must never
+# execute. The other, valid window must still render (per-window
+# independence from the C2 fix holds even when the sibling window fails
+# validation).
+rm -f "$GUL_CACHE"
+d1_json=$(jq -n '{
+  workspace: {current_dir: "/tmp"},
+  context_window: {used_percentage: 5},
+  rate_limits: {
+    five_hour: {used_percentage: "1);system(\"id\")", resets_at: 9999999999},
+    seven_day: {used_percentage: 30, resets_at: 9999999999}
+  }
+}')
+d1_out=$(printf '%s' "$d1_json" | CLAUDE_CONFIG_DIR="$HOME/.claude" bash "$STATUSLINE" 2>&1)
+d1_status=$?
+assert_eq "test_malicious_used_percentage_no_execution: statusline exits 0" "0" "$d1_status"
+echo "$d1_out" | grep -q '30%'
+check "test_malicious_used_percentage_no_execution: valid sibling window (7d) still renders" $?
+echo "$d1_out" | grep -qi 'system\|command not found\|syntax error'
+[[ $? -ne 0 ]]; check "test_malicious_used_percentage_no_execution: no injected payload text or shell error in output" $?
+rm -f "$GUL_CACHE"
+
+# D1: same guard on context_window.used_percentage — falls through to
+# the safe token-count fallback rather than handing an unvalidated
+# string to progress_bar's bash arithmetic.
+d1_ctx_json=$(jq -n '{workspace:{current_dir:"/tmp"}, context_window:{used_percentage:"1);system(\"id\")", context_window_size:200000, current_usage:{input_tokens:1000}}}')
+d1_ctx_out=$(printf '%s' "$d1_ctx_json" | CLAUDE_CONFIG_DIR="$HOME/.claude" bash "$STATUSLINE" 2>&1)
+d1_ctx_status=$?
+assert_eq "test_malicious_context_used_percentage_no_execution: statusline exits 0" "0" "$d1_ctx_status"
+echo "$d1_ctx_out" | grep -qi 'system\|command not found\|syntax error'
+[[ $? -ne 0 ]]; check "test_malicious_context_used_percentage_no_execution: no injected payload text or shell error in output" $?
+
+# D1: legitimate float used_percentage (real payload shape) still
+# validates and renders.
+d1_float_json=$(jq -n '{
+  workspace: {current_dir: "/tmp"},
+  context_window: {used_percentage: 5},
+  rate_limits: {five_hour: {used_percentage: 14.000000000000002, resets_at: 9999999999}}
+}')
+d1_float_out=$(printf '%s' "$d1_float_json" | CLAUDE_CONFIG_DIR="$HOME/.claude" bash "$STATUSLINE" 2>/dev/null)
+echo "$d1_float_out" | grep -q '14%'
+check "test_float_used_percentage_renders: 14.000000000000002 renders as 14%" $?
+rm -f "$GUL_CACHE"
+
+# D2: strip_ctrl removes C0 control bytes + DEL, leaving printable text
+# intact.
+STRIP_CTRL_SRC=$(extract_func "$STATUSLINE" strip_ctrl)
+eval "$STRIP_CTRL_SRC"
+d2_stripped=$(strip_ctrl $'evil\033[31mBAD')
+assert_eq "test_strip_ctrl_removes_esc: ESC byte removed, printable text intact" 'evil[31mBAD' "$d2_stripped"
+d2_stripped_del=$(strip_ctrl $'oops\177done')
+assert_eq "test_strip_ctrl_removes_del: DEL byte removed" 'oopsdone' "$d2_stripped_del"
+
+# D2: hyperlink() strips embedded ESC from both url and text — total
+# ESC count in the rendered link must equal exactly the 4 bytes the
+# OSC 8 wrapper itself always emits, never more.
+HYPERLINK_SRC=$(extract_func "$STATUSLINE" hyperlink)
+eval "$HYPERLINK_SRC"
+d2_hl_out=$(hyperlink $'http://evil\033]52;c;PWNED' $'text\033TEXT')
+d2_hl_esc_count=$(printf '%s' "$d2_hl_out" | tr -cd '\033' | wc -c | tr -d ' ')
+assert_eq "test_hyperlink_strips_embedded_esc: only the 4 OSC8-wrapper ESC bytes remain" "4" "$d2_hl_esc_count"
+
+# D2: a branch name containing ESC (the genuinely attacker-influenceable
+# vector — repo/branch strings ultimately come from git, which a
+# malicious remote or worktree setup could poison) must never carry a
+# raw ESC byte into the rendered line. get_branch() is exercised
+# directly against a stubbed `git` so the sanitization is verified
+# regardless of whether the installed git build would itself accept
+# such a ref name.
+GET_BRANCH_SRC=$(extract_func "$STATUSLINE" get_branch)
+eval "$GET_BRANCH_SRC"
+git() { printf 'evil\033PWNED'; }
+CWD=/tmp
+d2_branch_out=$(get_branch)
+unset -f git
+d2_branch_esc_count=$(printf '%s' "$d2_branch_out" | tr -cd '\033' | wc -c | tr -d ' ')
+assert_eq "test_get_branch_strips_esc: branch name ESC stripped" "0" "$d2_branch_esc_count"
+echo "$d2_branch_out" | grep -q "evilPWNED"
+check "test_get_branch_strips_esc: sanitized text still present" $?
+
+# ─────────────────────────────────────────────────────────────
+# Area: D3 — RUNTIME_DIR must also be refused when it's group/other
+# writable. mkdir -m 700 only applies at CREATE time; an existing dir
+# we own but that somehow ended up 0777 (pre-created, race, misconfigured
+# umask) must be refused just like the ownership/symlink cases.
+# ─────────────────────────────────────────────────────────────
+rm -rf "$RUNTIME_DIR"
+mkdir -p "$RUNTIME_DIR"
+chmod 0777 "$RUNTIME_DIR"
+CLAUDE_CONFIG_DIR="$HOME/.claude" bash "$STATUSLINE" </dev/null >/dev/null 2>/tmp/.cll_perm_stderr
+grep -q "refusing to use" /tmp/.cll_perm_stderr
+check "test_runtime_dir_group_other_writable_refused: 0777 owned-but-unsafe RUNTIME_DIR refused" $?
+rm -f /tmp/.cll_perm_stderr
+
+mkdir -p "$RUNTIME_DIR"
+chmod 700 "$RUNTIME_DIR"
+
+# ─────────────────────────────────────────────────────────────
 # Area: PR — stdin-first, gh fallback
 # ─────────────────────────────────────────────────────────────
 PRSTDIN_DIR=$(mktemp -d)

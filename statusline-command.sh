@@ -99,6 +99,18 @@ verify_runtime_dir() {
   if [[ -L "$RUNTIME_DIR" || ! -d "$RUNTIME_DIR" || ! -O "$RUNTIME_DIR" ]]; then
     echo "claudeline: refusing to use ${RUNTIME_DIR} — it isn't a directory we own (pre-created or symlinked by another process); lock/artifact/sentinel/cache writes disabled for this run" >&2
     RUNTIME_DIR_SAFE=0
+    return
+  fi
+
+  # mkdir -m 700 only applies at CREATE time — an already-existing dir we
+  # own (pre-created by another process, or left behind with a
+  # misconfigured umask) can still be group/other-writable, letting any
+  # co-tenant read or race every lock/artifact/cache written under it.
+  local mode
+  mode=$(stat -f%Lp "$RUNTIME_DIR" 2>/dev/null || stat -c%a "$RUNTIME_DIR" 2>/dev/null)
+  if [[ "$mode" =~ ^[0-7]+$ ]] && (( (8#$mode) & 8#077 )); then
+    echo "claudeline: refusing to use ${RUNTIME_DIR} — group/other-accessible permissions (${mode}, expected 700); lock/artifact/sentinel/cache writes disabled for this run" >&2
+    RUNTIME_DIR_SAFE=0
   fi
 }
 verify_runtime_dir
@@ -233,6 +245,13 @@ get_usage_limits() {
     seven_reset=$cache_seven_reset
   fi
 
+  # Validate before this reaches awk/bash arithmetic (render_usage_segment,
+  # the rollover comparisons below) — an invalid value is treated as
+  # ABSENT, never fabricated as 0. Applies regardless of source (stdin or
+  # cache), and runs before the cache write so a bad value never persists.
+  [[ "$five_pct" =~ ^[0-9]+(\.[0-9]+)?$ ]] || five_pct=""
+  [[ "$seven_pct" =~ ^[0-9]+(\.[0-9]+)?$ ]] || seven_pct=""
+
   ((have_stdin)) && write_usage_cache "$five_pct" "$five_reset" "$seven_pct" "$seven_reset"
 
   { [[ -z "$five_pct" || "$five_pct" == "null" ]] && [[ -z "$seven_pct" || "$seven_pct" == "null" ]]; } && return
@@ -269,10 +288,13 @@ get_usage_limits() {
 # Context window
 # ─────────────────────────────────────────────────────────────
 get_context() {
-  # Prefer the pre-calculated used_percentage if available
+  # Prefer the pre-calculated used_percentage if available — validated
+  # before it reaches progress_bar's bash arithmetic ($((...))); an
+  # invalid value (never trust stdin) falls through to the token-count
+  # fallback below rather than being handed to arithmetic unvalidated.
   local percent
   percent=$(echo "$INPUT" | jq -r '.context_window.used_percentage // empty')
-  if [[ -n "$percent" && "$percent" != "null" ]]; then
+  if [[ "$percent" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
     echo "$percent"
     return
   fi
@@ -333,7 +355,7 @@ is_git_repo() {
 }
 
 get_repo_name() {
-  basename "$(git -C "$CWD" rev-parse --show-toplevel 2>/dev/null)"
+  strip_ctrl "$(basename "$(git -C "$CWD" rev-parse --show-toplevel 2>/dev/null)")"
 }
 
 get_repo_url() {
@@ -357,14 +379,27 @@ get_repo_url() {
   echo "$remote_url"
 }
 
+# Strips C0 control bytes (0x00-0x1f) and DEL (0x7f) from any
+# stdin/git-derived string before it's emitted into a terminal escape —
+# a raw ESC in a branch name, PR field, or URL could otherwise smuggle
+# an arbitrary escape sequence (cursor moves, OSC 52 clipboard writes,
+# a forged hyperlink) into the rendered line.
+strip_ctrl() {
+  printf '%s' "$1" | tr -d '\000-\037\177'
+}
+
 # OSC 8 hyperlink: \033]8;;URL\033\\TEXT\033]8;;\033\\
 hyperlink() {
-  local url=$1 text=$2
+  local url text
+  url=$(strip_ctrl "$1")
+  text=$(strip_ctrl "$2")
   printf '\033]8;;%s\033\\%s\033]8;;\033\\' "$url" "$text"
 }
 
 get_branch() {
-  git -C "$CWD" branch --show-current 2>/dev/null || git -C "$CWD" rev-parse --short HEAD 2>/dev/null
+  local branch
+  branch=$(git -C "$CWD" branch --show-current 2>/dev/null || git -C "$CWD" rev-parse --short HEAD 2>/dev/null)
+  strip_ctrl "$branch"
 }
 
 get_pr_number() {
@@ -521,7 +556,7 @@ build_output() {
     # falling back to get_pr_number's gh lookup only when stdin doesn't
     # carry it.
     local stdin_pr_number stdin_pr_url
-    stdin_pr_number=$(echo "$INPUT" | jq -r '.pr.number // empty')
+    stdin_pr_number=$(strip_ctrl "$(echo "$INPUT" | jq -r '.pr.number // empty')")
     stdin_pr_url=$(echo "$INPUT" | jq -r '.pr.url // empty')
 
     pr_link=""
