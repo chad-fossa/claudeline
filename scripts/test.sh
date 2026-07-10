@@ -6,6 +6,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STATUSLINE="$REPO_ROOT/statusline-command.sh"
 HOOK="$REPO_ROOT/hooks/show-usage-limits.sh"
 INSTALL="$REPO_ROOT/install.sh"
+CAPTURE="$REPO_ROOT/scripts/capture-profile-session.sh"
 
 PASS=0
 FAIL=0
@@ -52,7 +53,7 @@ extract_func() {
 # ─────────────────────────────────────────────────────────────
 # Check 0: syntax
 # ─────────────────────────────────────────────────────────────
-for f in "$STATUSLINE" "$HOOK" "$INSTALL"; do
+for f in "$STATUSLINE" "$HOOK" "$INSTALL" "$CAPTURE"; do
   bash -n "$f" 2>/dev/null
   check "syntax: ${f#"$REPO_ROOT"/}" $?
 done
@@ -71,7 +72,9 @@ mkdir -p "$HOME/.claude" "$HOME/.claude-personal"
 # ─────────────────────────────────────────────────────────────
 DETECT_SRC=$(extract_func "$STATUSLINE" detect_account)
 HOOK_DETECT_SRC=$(extract_func "$HOOK" detect_account)
+CAPTURE_DETECT_SRC=$(extract_func "$CAPTURE" detect_account)
 assert_eq "detect_account identical in statusline + hook" "$DETECT_SRC" "$HOOK_DETECT_SRC"
+assert_eq "detect_account identical in statusline + capture script" "$DETECT_SRC" "$CAPTURE_DETECT_SRC"
 
 eval "$DETECT_SRC"
 
@@ -356,6 +359,51 @@ assert_eq "500 e2e: cache numbers untouched" "42" "$(jq -r '.five_hour.utilizati
 rm -rf "$E2E_DIR" "$E2ECURL" "$CURLSTUB2"
 rm -f "/tmp/.claude_usage_limits_personal.json" "/tmp/.claude_cred_refresh_failed_personal" /tmp/.cll_e2e_stderr
 rmdir "/tmp/.claude_cred_lock_personal" 2>/dev/null
+
+# ─────────────────────────────────────────────────────────────
+# Area: capture-profile-session.sh (manual provenance-stamped capture,
+# user-run only — never invoked by hook/statusline)
+# ─────────────────────────────────────────────────────────────
+CAP_DIR=$(mktemp -d)
+CAPSEC=$(mktemp -d)
+cat > "$CAPSEC/security" <<'EOF'
+#!/bin/bash
+echo '{"claudeAiOauth":{"accessToken":"tok_fake_capture","refreshToken":"rtok_fake_capture","expiresAt":9999999999999,"email":"person@example.com"}}'
+EOF
+chmod +x "$CAPSEC/security"
+
+# Happy path
+CAP_CONFIG_DIR="$CAP_DIR/claude-personal"
+mkdir -p "$CAP_CONFIG_DIR"
+echo '{"oauthAccount":{"accountUuid":"profile-uuid-abc"}}' > "$CAP_CONFIG_DIR/.claude.json"
+
+cap_out=$(CLAUDE_CONFIG_DIR="$CAP_CONFIG_DIR" PATH="$CAPSEC:$PATH" bash "$CAPTURE" 2>&1)
+cap_status=$?
+check "capture happy path: exits 0" $cap_status
+[[ -f "$CAP_CONFIG_DIR/.credentials.json" ]]; check "capture happy path: file written" $?
+assert_eq "capture happy path: captured_for_uuid == profile uuid" "profile-uuid-abc" "$(jq -r '.claudeline.captured_for_uuid' "$CAP_CONFIG_DIR/.credentials.json" 2>/dev/null)"
+cap_perms=$(stat -f%Lp "$CAP_CONFIG_DIR/.credentials.json" 2>/dev/null || stat -c%a "$CAP_CONFIG_DIR/.credentials.json" 2>/dev/null)
+assert_eq "capture happy path: perms 600" "600" "$cap_perms"
+echo "$cap_out" | grep -q "tok_fake_capture"
+[[ $? -ne 0 ]]; check "capture happy path: no token value on stdout" $?
+
+# Missing uuid -> abort, no file
+CAP_CONFIG_DIR2="$CAP_DIR/claude-personal-nouuid"
+mkdir -p "$CAP_CONFIG_DIR2"
+echo '{}' > "$CAP_CONFIG_DIR2/.claude.json"
+CLAUDE_CONFIG_DIR="$CAP_CONFIG_DIR2" PATH="$CAPSEC:$PATH" bash "$CAPTURE" >/dev/null 2>&1
+cap_status=$?
+[[ "$cap_status" != "0" ]]; check "capture missing uuid: exits 1" $?
+[[ ! -f "$CAP_CONFIG_DIR2/.credentials.json" ]]; check "capture missing uuid: no file written" $?
+
+# ACCOUNT_ASSUMED=1 (CLAUDE_CONFIG_DIR unset) -> refuse, no file
+rm -f "$HOME/.claude/.credentials.json"
+PATH="$CAPSEC:$PATH" bash -c "unset CLAUDE_CONFIG_DIR; bash '$CAPTURE'" >/dev/null 2>&1
+cap_status=$?
+[[ "$cap_status" != "0" ]]; check "capture ACCOUNT_ASSUMED=1: exits 1" $?
+[[ ! -f "$HOME/.claude/.credentials.json" ]]; check "capture ACCOUNT_ASSUMED=1: no file written" $?
+
+rm -rf "$CAP_DIR" "$CAPSEC"
 
 # ─────────────────────────────────────────────────────────────
 # Area: render markers (shared_login_marker / unverifiable_marker)
