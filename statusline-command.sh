@@ -137,14 +137,27 @@ write_usage_cache() {
   ((ACCOUNT_ASSUMED)) && return
   local five_pct=$1 five_reset=$2 seven_pct=$3 seven_reset=$4
 
-  # Skip the write entirely when nothing actually changed — this
-  # rewrote on every render before (every render re-derives the same
-  # stdin values); comparing against what's already on disk restores a
-  # throttle without a time-based TTL.
+  # Skip the write only when the four values are unchanged from disk AND
+  # the on-disk fetched_at is still younger than this floor. An
+  # unconditional skip (every render re-derives the same stdin values
+  # while usage sits flat) would let fetched_at freeze indefinitely,
+  # eventually age past resolve_usage_values's 900s read-side staleness
+  # bound, and blank the segment even though the numbers were never
+  # wrong — the throttle would defeat the cache's whole purpose. The
+  # floor keeps the throttle (at most one write per this many seconds
+  # while idle) while guaranteeing fetched_at is refreshed well inside
+  # the read bound.
+  local refresh_floor=300
   if [[ -f "$USAGE_CACHE" ]]; then
-    local existing
-    existing=$(jq -r '[(.five_hour.used_percentage // ""), (.five_hour.resets_at // ""), (.seven_day.used_percentage // ""), (.seven_day.resets_at // "")] | map(tostring) | join("")' "$USAGE_CACHE" 2>/dev/null)
-    [[ "$existing" == "${five_pct}"$'\x01'"${five_reset}"$'\x01'"${seven_pct}"$'\x01'"${seven_reset}" ]] && return
+    local existing existing_five_pct existing_five_reset existing_seven_pct existing_seven_reset existing_fetched_at
+    existing=$(jq -r '[(.five_hour.used_percentage // ""), (.five_hour.resets_at // ""), (.seven_day.used_percentage // ""), (.seven_day.resets_at // ""), (.fetched_at // "")] | map(tostring) | join("\u0001")' "$USAGE_CACHE" 2>/dev/null)
+    IFS=$'\x01' read -r existing_five_pct existing_five_reset existing_seven_pct existing_seven_reset existing_fetched_at <<< "$existing"
+    if [[ "$existing_five_pct" == "$five_pct" && "$existing_five_reset" == "$five_reset" \
+      && "$existing_seven_pct" == "$seven_pct" && "$existing_seven_reset" == "$seven_reset" \
+      && "$existing_fetched_at" =~ ^[0-9]+$ ]] \
+      && (( $(date +%s) - existing_fetched_at < refresh_floor )); then
+      return
+    fi
   fi
 
   # Atomic write: tmp file + mv, not a direct redirect into $USAGE_CACHE

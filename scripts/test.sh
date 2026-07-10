@@ -785,6 +785,34 @@ sleep 1
 write_usage_cache 42 9999999999 30 9999999999
 wuc_fetched_2=$(jq -r '.fetched_at' "$WUC_CACHE" 2>/dev/null)
 assert_eq "test_write_usage_cache_skips_unchanged: fetched_at untouched when values are identical" "$wuc_fetched_1" "$wuc_fetched_2"
+rm -f "$WUC_CACHE"
+
+# test_write_usage_cache_refreshes_on_age_floor_when_unchanged — even
+# though the four values are IDENTICAL to what's on disk, a cache whose
+# fetched_at is already older than the refresh floor must still be
+# rewritten (fetched_at advanced to ~now). Without this, a flat usage
+# window would freeze fetched_at forever, it would eventually age past
+# resolve_usage_values's 900s read-side staleness bound, and the segment
+# would blank out even though the numbers were never wrong.
+wuc_old_fetched=$(( $(date +%s) - 400 ))
+jq -n --argjson f 9999999999 --argjson fa "$wuc_old_fetched" \
+  '{five_hour:{used_percentage:42,resets_at:$f},seven_day:{used_percentage:30,resets_at:$f},fetched_at:$fa}' > "$WUC_CACHE"
+write_usage_cache 42 9999999999 30 9999999999
+wuc_refreshed_fetched=$(jq -r '.fetched_at' "$WUC_CACHE" 2>/dev/null)
+[[ "$wuc_refreshed_fetched" != "$wuc_old_fetched" ]] && (( $(date +%s) - wuc_refreshed_fetched < 5 ))
+check "test_write_usage_cache_refreshes_on_age_floor_when_unchanged: unchanged values but stale fetched_at still rewritten" $?
+rm -f "$WUC_CACHE"
+
+# A cache younger than the refresh floor (10s old, well under it) with
+# unchanged values must still be left untouched — the floor only forces
+# a write once the cache has actually gone stale-ish, not on every call.
+wuc_young_fetched=$(( $(date +%s) - 10 ))
+jq -n --argjson f 9999999999 --argjson fa "$wuc_young_fetched" \
+  '{five_hour:{used_percentage:42,resets_at:$f},seven_day:{used_percentage:30,resets_at:$f},fetched_at:$fa}' > "$WUC_CACHE"
+write_usage_cache 42 9999999999 30 9999999999
+wuc_young_after=$(jq -r '.fetched_at' "$WUC_CACHE" 2>/dev/null)
+assert_eq "test_write_usage_cache_skips_unchanged_within_refresh_floor: 10s-old unchanged cache left untouched" "$wuc_young_fetched" "$wuc_young_after"
+rm -f "$WUC_CACHE"
 
 # A genuinely different value must still write through.
 sleep 1
@@ -812,6 +840,34 @@ wuc_tmp_leftover=$(find "$RUNTIME_DIR" -maxdepth 1 -name '.claude_usage_limits_w
 [[ -z "$wuc_tmp_leftover" ]]
 check "test_write_usage_cache_atomic: no leftover tmp file after write" $?
 rm -f "$WUC_CACHE"
+
+# test_stdin_unchanged_values_refresh_fetched_at_end_to_end — proves the
+# fix through the whole write-then-read path, not just write_usage_cache
+# in isolation. Seed a cache with fetched_at 400s old and the SAME
+# five_hour value the stdin payload below also carries; the first render
+# must still refresh fetched_at despite the values matching (the age
+# floor forces it). A second render with NO rate_limits on stdin then
+# must still show the usage segment, proving fetched_at was genuinely
+# advanced and the 900s read-side bound wasn't tripped.
+rm -f "$GUL_CACHE"
+GUL_E2E_FIVE=$(( $(date +%s) + 3600 ))
+GUL_E2E_OLD_FETCHED=$(( $(date +%s) - 400 ))
+jq -n --argjson f "$GUL_E2E_FIVE" --argjson fa "$GUL_E2E_OLD_FETCHED" \
+  '{five_hour:{used_percentage:66,resets_at:$f},seven_day:{},fetched_at:$fa}' > "$GUL_CACHE"
+gul_e2e_stdin=$(jq -n --argjson f "$GUL_E2E_FIVE" '{
+  workspace: {current_dir: "/tmp"},
+  context_window: {used_percentage: 5},
+  rate_limits: {five_hour: {used_percentage: 66, resets_at: $f}}
+}')
+printf '%s' "$gul_e2e_stdin" | CLAUDE_CONFIG_DIR="$HOME/.claude" bash "$STATUSLINE" >/dev/null 2>&1
+gul_e2e_fetched=$(jq -r '.fetched_at' "$GUL_CACHE" 2>/dev/null)
+(( $(date +%s) - gul_e2e_fetched < 5 ))
+check "test_stdin_unchanged_values_refresh_fetched_at_end_to_end: fetched_at refreshed despite unchanged values" $?
+
+gul_e2e_out2=$(printf '%s' "$NO_RATE_LIMITS_JSON" | CLAUDE_CONFIG_DIR="$HOME/.claude" bash "$STATUSLINE" 2>/dev/null)
+echo "$gul_e2e_out2" | grep -q '66%'
+check "test_stdin_unchanged_values_refresh_fetched_at_end_to_end: second render (no stdin rate_limits) still shows usage from refreshed cache" $?
+rm -f "$GUL_CACHE"
 
 # ─────────────────────────────────────────────────────────────
 # Area: no dead subsystem references anywhere in the tree (full-tree
