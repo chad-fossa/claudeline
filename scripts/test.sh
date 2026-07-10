@@ -516,6 +516,15 @@ assert_eq "500 e2e: credentials file unchanged" "$before_e2e_creds" "$(cat "$E2E
 assert_eq "500 e2e: cache token_source=file-refresh-failed" "file-refresh-failed" "$(jq -r '.token_source' "/tmp/.claude_usage_limits_personal.json")"
 assert_eq "500 e2e: cache numbers untouched" "42" "$(jq -r '.five_hour.utilization' "/tmp/.claude_usage_limits_personal.json")"
 
+# Cold-start 500 e2e: no pre-existing cache -> handle_refresh_failure must
+# NOT fabricate one. The /tmp artifact still records the event.
+rm -f "/tmp/.claude_usage_limits_personal.json" "/tmp/.claude_cred_refresh_failed_personal"
+rm -f "$E2E_CREDS_DIR/.credentials.json.bak"
+CLAUDE_CONFIG_DIR="$E2E_CREDS_DIR" PATH="$E2ECURL:$PATH" bash "$HOOK" </dev/null >/dev/null 2>/dev/null
+[[ ! -f "/tmp/.claude_usage_limits_personal.json" ]]; check "cold-start 500 e2e: no cache file created" $?
+[[ -f "/tmp/.claude_cred_refresh_failed_personal" ]]; check "cold-start 500 e2e: refresh-failed artifact still created" $?
+rm -f "/tmp/.claude_cred_refresh_failed_personal"
+
 # lock_held e2e: a sibling render already owns the refresh — this render
 # must be a BENIGN SILENT SKIP (no failure artifact, no token_source
 # mutation, no ! marker) rather than treating lock contention as a
@@ -780,6 +789,45 @@ result=$?
 
 rm -rf "$FPM_DIR"
 unset ACCOUNT_ID CLAUDE_CONFIG_DIR
+
+# ─────────────────────────────────────────────────────────────
+# Area: get_usage_limits cold-start / warm-cache gating (C5 — cold start
+# must not fabricate numbers). A refresh-failure cache with no real
+# five_hour/fetched_at data must render NO usage segment at all (not a
+# fabricated "0%"); a warm cache (real data + token_source=
+# file-refresh-failed) still renders stale numbers + the ! marker exactly
+# as before.
+# ─────────────────────────────────────────────────────────────
+GUL_DIR=$(mktemp -d)
+GUL_CONFIG_DIR="$GUL_DIR/claude-personal"
+mkdir -p "$GUL_CONFIG_DIR"
+rm -f "/tmp/.claude_usage_limits_personal.json"
+
+# Cold-start: cache has only token_source (no fetched_at/five_hour) ->
+# no usage segment, no fabricated 0% anywhere. used_percentage=7 (not 10)
+# so the context-window "7%" can't be mistaken for a fabricated "...0%".
+cat > "/tmp/.claude_usage_limits_personal.json" <<'EOF'
+{"token_source":"file-refresh-failed"}
+EOF
+gul_out=$(echo '{"workspace":{"current_dir":"/tmp"},"context_window":{"used_percentage":7}}' | CLAUDE_CONFIG_DIR="$GUL_CONFIG_DIR" bash "$STATUSLINE" 2>/dev/null)
+echo "$gul_out" | grep -q '5h:'
+[[ $? -ne 0 ]]; check "cold-start refresh failure: no usage segment rendered" $?
+echo "$gul_out" | grep -q '0%'
+[[ $? -ne 0 ]]; check "cold-start refresh failure: no fabricated 0% anywhere" $?
+
+# Warm cache: real data present + token_source=file-refresh-failed ->
+# stale numbers still render, plus the ! marker (preserved behavior).
+cat > "/tmp/.claude_usage_limits_personal.json" <<EOF
+{"five_hour":{"utilization":42},"seven_day":{"utilization":7},"fetched_at":$(date +%s),"token_source":"file-refresh-failed"}
+EOF
+gul_out2=$(echo '{"workspace":{"current_dir":"/tmp"},"context_window":{"used_percentage":7}}' | CLAUDE_CONFIG_DIR="$GUL_CONFIG_DIR" bash "$STATUSLINE" 2>/dev/null)
+echo "$gul_out2" | grep -q '42%'
+check "warm-cache refresh failure: stale numbers still render" $?
+echo "$gul_out2" | grep -q '!'
+check "warm-cache refresh failure: ! marker still renders" $?
+
+rm -f "/tmp/.claude_usage_limits_personal.json"
+rm -rf "$GUL_DIR"
 
 # ─────────────────────────────────────────────────────────────
 # Area: profile-aware hook path (resolve_usage_refresh_hook)

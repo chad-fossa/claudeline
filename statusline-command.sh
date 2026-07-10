@@ -125,6 +125,14 @@ get_usage_limits() {
     return
   fi
 
+  # A cache written only by handle_refresh_failure's cold-start artifact
+  # (pre-fix) or any cache missing fetched_at/five_hour has no real usage
+  # data — jq's `// 0` below would otherwise render a fabricated "0%".
+  # Gate on fetched_at directly instead of trusting the defaulted values.
+  local fetched_at
+  fetched_at=$(jq -r '.fetched_at // empty' "$USAGE_CACHE" 2>/dev/null)
+  [[ -z "$fetched_at" ]] && return
+
   local five_hour seven_day reset5 reset7
   five_hour=$(jq -r '.five_hour.utilization // 0' "$USAGE_CACHE" 2>/dev/null)
   seven_day=$(jq -r '.seven_day.utilization // 0' "$USAGE_CACHE" 2>/dev/null)

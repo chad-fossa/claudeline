@@ -395,8 +395,15 @@ mini_bar() {
 }
 
 # A failed file-based refresh never falls back to Keychain silently: drop a
-# loud artifact, merge token_source into whatever cache already exists
-# (leaving its numbers untouched), and let the render continue on stale data.
+# loud artifact, and if a cache already exists, merge token_source into it
+# (leaving its numbers untouched) so the render continues on stale data.
+# On a cold start (no cache yet) do NOT fabricate one — a
+# {token_source:"file-refresh-failed"} cache with no five_hour/seven_day
+# data would render "5h:0% 7d:0%" via statusline's `// 0` jq defaults,
+# which is a fabricated number, not real usage. The /tmp artifact above
+# already records the failure; statusline's get_usage_limits treats a
+# missing cache (or one missing fetched_at) as "no usage segment", same
+# as today's no-cache-yet behavior.
 handle_refresh_failure() {
   local reason="${REFRESH_FAIL_REASON:-unknown}"
   local artifact="/tmp/.claude_cred_refresh_failed_${ACCOUNT_ID}"
@@ -406,8 +413,6 @@ handle_refresh_failure() {
     local merged
     merged=$(jq '. + {token_source: "file-refresh-failed"}' "$CACHE_FILE" 2>/dev/null)
     [[ -n "$merged" ]] && echo "$merged" > "$CACHE_FILE"
-  else
-    jq -n '{token_source: "file-refresh-failed"}' > "$CACHE_FILE"
   fi
 
   echo "${DIM}Usage: credential refresh failed (${reason})${RESET}" >&2
