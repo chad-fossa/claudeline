@@ -56,7 +56,10 @@ Claude Code hands each session its own usage limits on the statusline's stdin (`
 
 ## Usage
 
-Usage limits arrive automatically on every render, as part of the same JSON input Claude Code already sends the statusline. A brand-new session has no `rate_limits` yet — the usage segment stays blank until your first prompt gets its first API response, then it shows up on the next render and stays current from there.
+Usage limits arrive automatically on every render, as part of the same JSON input Claude Code already sends the statusline. There are two reasons the segment can be blank:
+
+- **Temporary:** a brand-new session has no `rate_limits` yet. It stays blank until your first prompt gets its first API response, then shows up on the next render and stays current from there.
+- **Permanent:** on some Claude.ai Max/OAuth configurations, `rate_limits` never arrives at all — see [anthropics/claude-code#40094](https://github.com/anthropics/claude-code/issues/40094) and [#45133](https://github.com/anthropics/claude-code/issues/45133) — and it's also expected on non-Pro/Max plans. There's no fallback for this case: claudeline no longer fetches usage on its own (the old fetch path was the cross-profile leak fixed in v0.7.0), so if the segment is still blank after a few prompts, the fix has to come from Claude Code upstream, not from claudeline.
 
 ## Multiple accounts
 
@@ -146,7 +149,7 @@ export CLAUDE_ACCOUNT_PERSONAL_COLOR=$'\033[35m' # magenta (default)
 - **jq**
 - **gh** (optional, for PR detection when stdin doesn't carry `.pr`)
 
-Usage shows up blank until your session's first API response — there's no pre-fetch, so a brand-new session simply has nothing to show yet.
+See [Usage](#usage) above if the usage segment stays blank — a brand-new session and an upstream gap look the same on screen but resolve differently.
 
 ## Manual installation
 

@@ -206,6 +206,13 @@ resolve_usage_values() {
   # render no usage segment rather than trust its contents this run.
   [[ "$RUNTIME_DIR_SAFE" != "1" ]] && return
 
+  # \x01 (not @tsv's tab) throughout this file's IFS=... read lines, on
+  # purpose: bash's `read` classifies tab as "IFS whitespace" no matter
+  # what IFS is set to, so it squashes/strips LEADING and consecutive
+  # tabs — silently misaligning every field whenever an early field is
+  # empty. Routine now that either usage window (or the PR fields) can
+  # be legitimately absent. \x01 isn't whitespace, so empty leading/
+  # middle fields still read into the right variable.
   local stdin_five_pct stdin_five_reset stdin_seven_pct stdin_seven_reset
   IFS=$'\x01' read -r stdin_five_pct stdin_five_reset stdin_seven_pct stdin_seven_reset < <(
     printf '%s' "$INPUT" | jq -r '[(.rate_limits.five_hour.used_percentage // ""), (.rate_limits.five_hour.resets_at // ""), (.rate_limits.seven_day.used_percentage // ""), (.rate_limits.seven_day.resets_at // "")] | map(tostring) | join("")' 2>/dev/null
@@ -244,6 +251,7 @@ resolve_usage_values() {
 }
 
 get_usage_limits() {
+  # \x01, not tab — see resolve_usage_values's read for why.
   local five_pct five_reset seven_pct seven_reset
   IFS=$'\x01' read -r five_pct five_reset seven_pct seven_reset < <(resolve_usage_values)
 
@@ -460,6 +468,7 @@ pr_link_for() {
 resolve_pr() {
   local repo=$1 branch=$2
 
+  # \x01, not tab — see resolve_usage_values's read for why.
   local stdin_pr_number stdin_pr_url
   IFS=$'\x01' read -r stdin_pr_number stdin_pr_url < <(
     echo "$INPUT" | jq -r '[(.pr.number // ""), (.pr.url // "")] | map(tostring) | join("")'
@@ -585,6 +594,7 @@ build_output() {
   if is_git_repo; then
     repo=$(get_repo_name)
     branch=$(get_branch)
+    # \x01, not tab — see resolve_usage_values's read for why.
     IFS=$'\x01' read -r pr pr_link < <(resolve_pr "$repo" "$branch")
 
     work_status=$(get_work_status)

@@ -56,7 +56,7 @@ echo '{"workspace":{"current_dir":"."},"context_window":{"used_percentage":5},"r
 cat /tmp/claudeline-<uid>/.claude_usage_limits_work.json
 ```
 
-The cache file is what a `rate_limits`-less render falls back to — if it doesn't exist, or its schema is unrecognized (an old pre-v0.7.0 cache), the `5h:X% 7d:X%` segment won't render (never a fabricated `0%`).
+The cache file is what a `rate_limits`-less render falls back to, per window — if it doesn't exist, its schema is unrecognized (an old pre-v0.7.0 cache), or `fetched_at` is more than 900s old, that window's segment won't render (never a fabricated `0%`).
 
 `scripts/test.sh` is this repo's smoke-test harness — no CI runs it, so run it manually before landing changes:
 

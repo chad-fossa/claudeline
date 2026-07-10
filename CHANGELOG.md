@@ -16,8 +16,20 @@ This is pre-1.0, so the removal below ships as a MINOR per this project's own ve
 - **Deleted from `install.sh`/`settings-example.json`**: the hook/capture-script downloads and the `hooks.SessionStart` wiring. Statusline + the `/usage` skill are the only artifacts installed now.
 - **Markers**: `?` (unverifiable) and `!` (refresh-failed) are gone — there's no fetch-time credential state left to flag. The dim `=` marker (both profiles logged into the same account) stays, since it reads `.claude.json` directly and has nothing to do with usage fetching.
 - **Cache schema**: mirrors stdin verbatim now — `{five_hour:{used_percentage,resets_at},seven_day:{...},fetched_at}`, with `resets_at` as a raw epoch int instead of an ISO string. An old v0.6.x-shaped cache is unrecognized and treated as absent (never renders a fabricated `0%`); the next stdin-carrying render overwrites it.
-- **Requirements**: Claude Code ≥2.1.80, and a Claude.ai Pro or Max plan (usage limits don't apply otherwise). Usage is blank until the session's first API response — there's no pre-fetch anymore, so a brand-new session simply has nothing to show yet.
-- **Migration**: `rm -f ~/.claude/hooks/show-usage-limits.sh ~/.claude*/scripts/capture-profile-session.sh` — stale caches from the old schema are auto-ignored, nothing else to do.
+- **Requirements**: Claude Code ≥2.1.80, and a Claude.ai Pro or Max plan (usage limits don't apply otherwise). Usage is blank until the session's first API response, same as before — but on some Claude.ai Max/OAuth configurations `rate_limits` never arrives on stdin at all ([anthropics/claude-code#40094](https://github.com/anthropics/claude-code/issues/40094), [#45133](https://github.com/anthropics/claude-code/issues/45133)); there's no fallback for that case since claudeline no longer fetches usage on its own.
+- **Migration**: remove the deleted scripts and the credential artifacts they left behind, for every profile you run (`~/.claude`, `~/.claude-personal`, …):
+  ```bash
+  rm -f ~/.claude/hooks/show-usage-limits.sh ~/.claude*/scripts/capture-profile-session.sh
+  rm -f ~/.claude/.credentials.json.bak ~/.claude-personal/.credentials.json.bak
+  rm -f /tmp/claudeline-*/.claude_cred_*
+  ```
+  `.credentials.json.bak` holds a live refresh token (written by the deleted `refresh_token_grant` before each rotation); `/tmp/claudeline-<uid>/.claude_cred_*` covers every leftover refresh/capture-failure/veto artifact the deleted hook and capture scripts dropped. Both are safe to remove on any platform.
+
+  **macOS only:** also remove the claudeline-*captured* `.credentials.json` itself (the copy the deleted `capture-profile-session.sh` wrote from Keychain) for each profile — macOS falls back to Keychain once it's gone, so this is safe.
+
+  **Linux: do NOT delete `.credentials.json`.** Linux has no Keychain — that file *is* Claude Code's own login there, not a claudeline artifact. Deleting it logs you out. The three `rm -f` lines above are the full Linux migration.
+
+  Stale caches from the old schema (`.claude_usage_limits_*.json`) are auto-ignored by the new schema check — nothing to do for those.
 - [anthropics/claude-code#20553](https://github.com/anthropics/claude-code/issues/20553) (the single-keychain-slot issue that motivated the `?`/`!` markers in the first place) no longer affects claudeline — usage isn't fetched via Keychain anymore, so there's nothing left to leak.
 
 ### Fixes
