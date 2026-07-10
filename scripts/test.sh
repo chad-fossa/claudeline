@@ -225,8 +225,8 @@ check "test_stdin_usage_rendered_and_cached: 7d renders 16%" $?
 [[ -f "$GUL_CACHE" ]]; check "test_stdin_usage_rendered_and_cached: cache written" $?
 assert_eq "test_stdin_usage_rendered_and_cached: cache used_percentage" "10" "$(jq -r '.five_hour.used_percentage' "$GUL_CACHE" 2>/dev/null)"
 assert_eq "test_stdin_usage_rendered_and_cached: cache resets_at is a raw epoch int" "$GUL_FIVE_EPOCH" "$(jq -r '.five_hour.resets_at' "$GUL_CACHE" 2>/dev/null)"
-gul_fetched_at=$(jq -r '.fetched_at' "$GUL_CACHE" 2>/dev/null)
-[[ -n "$gul_fetched_at" && "$gul_fetched_at" != "null" ]]; check "test_stdin_usage_rendered_and_cached: cache has fetched_at" $?
+gul_fetched_at=$(jq -r '.five_hour.fetched_at' "$GUL_CACHE" 2>/dev/null)
+[[ -n "$gul_fetched_at" && "$gul_fetched_at" != "null" ]]; check "test_stdin_usage_rendered_and_cached: cache has a per-window fetched_at" $?
 
 # test_stdin_absent_renders_from_fresh_cache — seeds its own fixture
 # rather than relying on the cache state the PRECEDING test happens to
@@ -236,7 +236,7 @@ rm -f "$GUL_CACHE"
 GUL_OWN_FIVE_EPOCH=$(( $(date +%s) + 3600 ))
 GUL_OWN_SEVEN_EPOCH=$(( $(date +%s) + 86400 ))
 jq -n --argjson f "$GUL_OWN_FIVE_EPOCH" --argjson s "$GUL_OWN_SEVEN_EPOCH" --argjson fa "$(date +%s)" \
-  '{five_hour:{used_percentage:10,resets_at:$f},seven_day:{used_percentage:16,resets_at:$s},fetched_at:$fa}' > "$GUL_CACHE"
+  '{five_hour:{used_percentage:10,resets_at:$f,fetched_at:$fa},seven_day:{used_percentage:16,resets_at:$s,fetched_at:$fa}}' > "$GUL_CACHE"
 gul_out2=$(printf '%s' "$NO_RATE_LIMITS_JSON" | CLAUDE_CONFIG_DIR="$HOME/.claude" bash "$STATUSLINE" 2>/dev/null)
 echo "$gul_out2" | grep -q '10%'
 check "test_stdin_absent_renders_from_fresh_cache: 5h renders from cache" $?
@@ -256,7 +256,7 @@ echo "$gul_out3" | grep -Eq '(5h|7d):[0-9]+%'
 gul_past=$(( $(date +%s) - 3600 ))
 gul_future=$(( $(date +%s) + 86400 ))
 jq -n --argjson f "$gul_past" --argjson s "$gul_future" --argjson now "$(date +%s)" \
-  '{five_hour:{used_percentage:99,resets_at:$f},seven_day:{used_percentage:22,resets_at:$s},fetched_at:$now}' > "$GUL_CACHE"
+  '{five_hour:{used_percentage:99,resets_at:$f,fetched_at:$now},seven_day:{used_percentage:22,resets_at:$s,fetched_at:$now}}' > "$GUL_CACHE"
 gul_out4=$(printf '%s' "$NO_RATE_LIMITS_JSON" | CLAUDE_CONFIG_DIR="$HOME/.claude" bash "$STATUSLINE" 2>/dev/null)
 echo "$gul_out4" | grep -q '99%'
 [[ $? -ne 0 ]]; check "test_per_window_rollover_5h_expired_7d_valid: expired 5h segment dropped" $?
@@ -299,7 +299,7 @@ rm -f "$GUL_CACHE"
 # the existing regex guard blanks it, which the rollover check then reads
 # as "no expiry" and renders regardless of the current time.
 jq -n --argjson fa "$(date +%s)" \
-  '{five_hour:{used_percentage:77,resets_at:"not-a-number"},seven_day:{},fetched_at:$fa}' > "$GUL_CACHE"
+  '{five_hour:{used_percentage:77,resets_at:"not-a-number",fetched_at:$fa},seven_day:{}}' > "$GUL_CACHE"
 nonnum_out=$(printf '%s' "$NO_RATE_LIMITS_JSON" | CLAUDE_CONFIG_DIR="$HOME/.claude" bash "$STATUSLINE" 2>&1)
 nonnum_status=$?
 assert_eq "test_non_numeric_resets_at_treated_as_no_expiry: statusline exits 0 (no arithmetic error)" "0" "$nonnum_status"
@@ -318,9 +318,13 @@ GUL_FUNC_SRC=$(extract_func "$STATUSLINE" get_usage_limits)
 RESOLVE_VALUES_SRC=$(extract_func "$STATUSLINE" resolve_usage_values)
 RESOLVE_WINDOW_SRC=$(extract_func "$STATUSLINE" resolve_window)
 RENDER_SEG_SRC=$(extract_func "$STATUSLINE" render_usage_segment)
-WRITE_CACHE_SRC=$(extract_func "$STATUSLINE" write_usage_cache)
+READ_CACHED_WINDOW_SRC=$(extract_func "$STATUSLINE" read_cached_window)
+WINDOW_CACHE_FRESH_SRC=$(extract_func "$STATUSLINE" window_cache_fresh)
+WRITE_USAGE_WINDOW_SRC=$(extract_func "$STATUSLINE" write_usage_window)
 eval "$RENDER_SEG_SRC"
-eval "$WRITE_CACHE_SRC"
+eval "$READ_CACHED_WINDOW_SRC"
+eval "$WINDOW_CACHE_FRESH_SRC"
+eval "$WRITE_USAGE_WINDOW_SRC"
 eval "$RESOLVE_WINDOW_SRC"
 eval "$RESOLVE_VALUES_SRC"
 eval "$GUL_FUNC_SRC"
@@ -332,7 +336,7 @@ boundary_before="" boundary_after="" boundary_out=""
 for _ in 1 2 3 4 5; do
   boundary_before=$(date +%s)
   jq -n --argjson f "$boundary_before" --argjson fa "$boundary_before" \
-    '{five_hour:{used_percentage:55,resets_at:$f},seven_day:{},fetched_at:$fa}' > "$USAGE_CACHE"
+    '{five_hour:{used_percentage:55,resets_at:$f,fetched_at:$fa},seven_day:{}}' > "$USAGE_CACHE"
   boundary_out=$(get_usage_limits)
   boundary_after=$(date +%s)
   [[ "$boundary_before" == "$boundary_after" ]] && break
@@ -375,7 +379,7 @@ rm -f "$GUL_CACHE"
 GUL_STALE_FETCHED=$(( $(date +%s) - 1200 ))
 GUL_STALE_FIVE=$(( $(date +%s) + 3600 ))
 jq -n --argjson f "$GUL_STALE_FIVE" --argjson fa "$GUL_STALE_FETCHED" \
-  '{five_hour:{used_percentage:42,resets_at:$f},seven_day:{used_percentage:33,resets_at:$f},fetched_at:$fa}' > "$GUL_CACHE"
+  '{five_hour:{used_percentage:42,resets_at:$f,fetched_at:$fa},seven_day:{used_percentage:33,resets_at:$f,fetched_at:$fa}}' > "$GUL_CACHE"
 gul_b_out=$(printf '%s' "$NO_RATE_LIMITS_JSON" | CLAUDE_CONFIG_DIR="$HOME/.claude" bash "$STATUSLINE" 2>/dev/null)
 echo "$gul_b_out" | grep -q '42%'
 [[ $? -ne 0 ]]; check "test_stale_cache_beyond_max_age_no_usage_segment: 5h segment dropped" $?
@@ -387,10 +391,101 @@ rm -f "$GUL_CACHE"
 GUL_FRESH_FETCHED=$(( $(date +%s) - 60 ))
 GUL_FRESH_FIVE=$(( $(date +%s) + 3600 ))
 jq -n --argjson f "$GUL_FRESH_FIVE" --argjson fa "$GUL_FRESH_FETCHED" \
-  '{five_hour:{used_percentage:42,resets_at:$f},seven_day:{used_percentage:33,resets_at:$f},fetched_at:$fa}' > "$GUL_CACHE"
+  '{five_hour:{used_percentage:42,resets_at:$f,fetched_at:$fa},seven_day:{used_percentage:33,resets_at:$f,fetched_at:$fa}}' > "$GUL_CACHE"
 gul_c_out=$(printf '%s' "$NO_RATE_LIMITS_JSON" | CLAUDE_CONFIG_DIR="$HOME/.claude" bash "$STATUSLINE" 2>/dev/null)
 echo "$gul_c_out" | grep -q '42%'
 check "test_fresh_cache_within_max_age_renders: 1-minute-old cache still renders" $?
+rm -f "$GUL_CACHE"
+
+# ─────────────────────────────────────────────────────────────
+# Area: FIX3 — per-window fetched_at (v0.7.0 final re-gate #3). fetched_at
+# was a single file-global timestamp for both windows. A window whose
+# stdin value keeps churning forces write_usage_cache to fire every
+# render, refreshing the SHARED fetched_at — which props up a genuinely
+# stale sibling window's freshness forever, since the 900s read bound and
+# 300s write floor both keyed off that one shared timestamp. Fix: stamp
+# fetched_at INSIDE each window object, only when THAT window is
+# (re)written from stdin.
+# ─────────────────────────────────────────────────────────────
+
+# (a) exact repro from the re-gate finding: seed seven_day 90% with a
+# 600s-old (OLD, file-global) fetched_at, then render three times with
+# ONLY five_hour churning on stdin. Under the file-global bug, five_hour's
+# churn keeps re-triggering a cache write that refreshes the shared
+# fetched_at, so seven_day never ages past the 900s bound and renders
+# undimmed forever even though it was never re-verified.
+rm -f "$GUL_CACHE"
+FIX3_SEVEN_FETCHED=$(( $(date +%s) - 600 ))
+FIX3_SEVEN_RESET=$(( $(date +%s) + 86400 ))
+jq -n --argjson r "$FIX3_SEVEN_RESET" --argjson fa "$FIX3_SEVEN_FETCHED" \
+  '{seven_day:{used_percentage:90,resets_at:$r},fetched_at:$fa}' > "$GUL_CACHE"
+fix3a_out=""
+for five_pct in 11 12 13; do
+  fix3a_json=$(jq -n --argjson p "$five_pct" '{workspace:{current_dir:"/tmp"},context_window:{used_percentage:5},rate_limits:{five_hour:{used_percentage:$p,resets_at:9999999999}}}')
+  fix3a_out=$(printf '%s' "$fix3a_json" | CLAUDE_CONFIG_DIR="$HOME/.claude" bash "$STATUSLINE" 2>/dev/null)
+done
+echo "$fix3a_out" | grep -q '13%'
+check "test_stale_sibling_not_propped_by_live_window: churning five_hour still renders its live value" $?
+echo "$fix3a_out" | grep -q '90%'
+[[ $? -ne 0 ]]; check "test_stale_sibling_not_propped_by_live_window: stale seven_day (fetched_at 600s old) never renders, not propped up by five_hour's churn" $?
+rm -f "$GUL_CACHE"
+
+# (b) each window independently honors its own 900s read bound: five_hour
+# fresh (60s old), seven_day stale (901s old) — five_hour renders, seven_day
+# doesn't, in the SAME render (no stdin rate_limits at all, pure cache read).
+rm -f "$GUL_CACHE"
+FIX3B_FIVE_FRESH=$(( $(date +%s) - 60 ))
+FIX3B_SEVEN_STALE=$(( $(date +%s) - 901 ))
+FIX3B_RESET=$(( $(date +%s) + 86400 ))
+jq -n --argjson r "$FIX3B_RESET" --argjson f5 "$FIX3B_FIVE_FRESH" --argjson f7 "$FIX3B_SEVEN_STALE" \
+  '{five_hour:{used_percentage:21,resets_at:$r,fetched_at:$f5},seven_day:{used_percentage:95,resets_at:$r,fetched_at:$f7}}' > "$GUL_CACHE"
+fix3b_out=$(printf '%s' "$NO_RATE_LIMITS_JSON" | CLAUDE_CONFIG_DIR="$HOME/.claude" bash "$STATUSLINE" 2>/dev/null)
+echo "$fix3b_out" | grep -q '21%'
+check "test_per_window_900s_read_bound: fresh five_hour (60s old) renders" $?
+echo "$fix3b_out" | grep -q '95%'
+[[ $? -ne 0 ]]; check "test_per_window_900s_read_bound: stale seven_day (901s old) does not render" $?
+rm -f "$GUL_CACHE"
+
+# (c) each window independently honors its own 300s write floor: seed
+# five_hour 400s old (past the floor, unchanged value incoming) and
+# seven_day 30s old (well under the floor, also unchanged) in the SAME
+# cache file. A stdin render carrying BOTH windows with identical values
+# must refresh only five_hour's fetched_at, leaving seven_day's untouched.
+rm -f "$GUL_CACHE"
+FIX3C_FIVE_OLD=$(( $(date +%s) - 400 ))
+FIX3C_SEVEN_YOUNG=$(( $(date +%s) - 30 ))
+FIX3C_RESET=$(( $(date +%s) + 86400 ))
+jq -n --argjson r "$FIX3C_RESET" --argjson f5 "$FIX3C_FIVE_OLD" --argjson f7 "$FIX3C_SEVEN_YOUNG" \
+  '{five_hour:{used_percentage:60,resets_at:$r,fetched_at:$f5},seven_day:{used_percentage:70,resets_at:$r,fetched_at:$f7}}' > "$GUL_CACHE"
+fix3c_json=$(jq -n --argjson r "$FIX3C_RESET" '{workspace:{current_dir:"/tmp"},context_window:{used_percentage:5},rate_limits:{five_hour:{used_percentage:60,resets_at:$r},seven_day:{used_percentage:70,resets_at:$r}}}')
+printf '%s' "$fix3c_json" | CLAUDE_CONFIG_DIR="$HOME/.claude" bash "$STATUSLINE" >/dev/null 2>&1
+fix3c_five_after=$(jq -r '.five_hour.fetched_at' "$GUL_CACHE" 2>/dev/null)
+fix3c_seven_after=$(jq -r '.seven_day.fetched_at' "$GUL_CACHE" 2>/dev/null)
+[[ "$fix3c_five_after" != "$FIX3C_FIVE_OLD" ]] && (( $(date +%s) - fix3c_five_after < 5 ))
+check "test_per_window_300s_write_floor: five_hour past its floor gets refreshed" $?
+assert_eq "test_per_window_300s_write_floor: seven_day within its floor is left untouched" "$FIX3C_SEVEN_YOUNG" "$fix3c_seven_after"
+rm -f "$GUL_CACHE"
+
+# (d) a legacy/pre-fix cache (single file-global fetched_at, no per-window
+# fetched_at) must render NOTHING — never migrated forward — and gets
+# fully replaced by the new per-window schema on the next stdin render.
+rm -f "$GUL_CACHE"
+FIX3D_LEGACY_FETCHED=$(( $(date +%s) - 60 ))
+FIX3D_RESET=$(( $(date +%s) + 86400 ))
+jq -n --argjson r "$FIX3D_RESET" --argjson fa "$FIX3D_LEGACY_FETCHED" \
+  '{five_hour:{used_percentage:12,resets_at:$r},seven_day:{used_percentage:34,resets_at:$r},fetched_at:$fa}' > "$GUL_CACHE"
+fix3d_out1=$(printf '%s' "$NO_RATE_LIMITS_JSON" | CLAUDE_CONFIG_DIR="$HOME/.claude" bash "$STATUSLINE" 2>/dev/null)
+echo "$fix3d_out1" | grep -Eq '(5h|7d):[0-9]+%'
+[[ $? -ne 0 ]]; check "test_legacy_global_fetched_at_cache_renders_nothing: legacy file-global-fetched_at cache never renders" $?
+
+fix3d_json=$(jq -n --argjson r "$FIX3D_RESET" '{workspace:{current_dir:"/tmp"},context_window:{used_percentage:5},rate_limits:{five_hour:{used_percentage:12,resets_at:$r},seven_day:{used_percentage:34,resets_at:$r}}}')
+fix3d_out2=$(printf '%s' "$fix3d_json" | CLAUDE_CONFIG_DIR="$HOME/.claude" bash "$STATUSLINE" 2>/dev/null)
+echo "$fix3d_out2" | grep -q '12%'
+check "test_legacy_global_fetched_at_cache_renders_nothing: next stdin render supplies both windows and renders" $?
+fix3d_five_fetched=$(jq -r '.five_hour.fetched_at' "$GUL_CACHE" 2>/dev/null)
+fix3d_seven_fetched=$(jq -r '.seven_day.fetched_at' "$GUL_CACHE" 2>/dev/null)
+[[ -n "$fix3d_five_fetched" && "$fix3d_five_fetched" != "null" && -n "$fix3d_seven_fetched" && "$fix3d_seven_fetched" != "null" ]]
+check "test_legacy_global_fetched_at_cache_renders_nothing: cache file replaced with new per-window-fetched_at schema" $?
 rm -f "$GUL_CACHE"
 
 # ─────────────────────────────────────────────────────────────
@@ -628,7 +723,7 @@ rm -rf "$GHSTUB2" "$PRSTDIN_DIR"
 
 # ─────────────────────────────────────────────────────────────
 # Area: PR-cache never persists under a guessed identity. Mirrors the
-# write_usage_cache guard above — get_pr_number had no ACCOUNT_ASSUMED
+# write_usage_window guard above — get_pr_number had no ACCOUNT_ASSUMED
 # guard on its cache/branch-cache/lock writes.
 # ─────────────────────────────────────────────────────────────
 PRASSUMED_DIR=$(mktemp -d)
@@ -862,29 +957,33 @@ pr_jq_spawns=$(grep -c "jq -r '.pr\." "$STATUSLINE")
 assert_eq "test_pr_fields_folded_into_one_jq_call: no separate .pr.number/.pr.url jq spawns remain" "0" "$pr_jq_spawns"
 
 # ─────────────────────────────────────────────────────────────
-# Area: C3 — write_usage_cache skips unchanged writes, writes atomically.
+# Area: C3 — write_usage_window skips unchanged writes, writes
+# atomically, and stamps ITS OWN fetched_at only (see FIX3 above for the
+# cross-window isolation this per-window design exists for).
 # ─────────────────────────────────────────────────────────────
-WUC_SRC=$(extract_func "$STATUSLINE" write_usage_cache)
-eval "$WUC_SRC"
+READ_CACHED_WINDOW_SRC=$(extract_func "$STATUSLINE" read_cached_window)
+WRITE_USAGE_WINDOW_SRC=$(extract_func "$STATUSLINE" write_usage_window)
+eval "$READ_CACHED_WINDOW_SRC"
+eval "$WRITE_USAGE_WINDOW_SRC"
 WUC_CACHE="${RUNTIME_DIR}/.claude_usage_limits_work.json"
 rm -f "$WUC_CACHE"
 ACCOUNT_ID=work
 ACCOUNT_ASSUMED=0
 USAGE_CACHE="$WUC_CACHE"
 
-# Seed an initial write, then call again with IDENTICAL values — the
-# file (and its fetched_at) must be left untouched (currently rewrites
-# on every render; was <=1/300s before this project's v0.6.x throttle).
-write_usage_cache 42 9999999999 30 9999999999
-wuc_fetched_1=$(jq -r '.fetched_at' "$WUC_CACHE" 2>/dev/null)
+# Seed an initial write, then call again with an IDENTICAL value — the
+# window's fetched_at must be left untouched (currently rewrites on every
+# render; was <=1/300s before this project's v0.6.x throttle).
+write_usage_window five_hour 42 9999999999
+wuc_fetched_1=$(jq -r '.five_hour.fetched_at' "$WUC_CACHE" 2>/dev/null)
 sleep 1
-write_usage_cache 42 9999999999 30 9999999999
-wuc_fetched_2=$(jq -r '.fetched_at' "$WUC_CACHE" 2>/dev/null)
-assert_eq "test_write_usage_cache_skips_unchanged: fetched_at untouched when values are identical" "$wuc_fetched_1" "$wuc_fetched_2"
+write_usage_window five_hour 42 9999999999
+wuc_fetched_2=$(jq -r '.five_hour.fetched_at' "$WUC_CACHE" 2>/dev/null)
+assert_eq "test_write_usage_window_skips_unchanged: fetched_at untouched when the value is identical" "$wuc_fetched_1" "$wuc_fetched_2"
 rm -f "$WUC_CACHE"
 
-# test_write_usage_cache_refreshes_on_age_floor_when_unchanged — even
-# though the four values are IDENTICAL to what's on disk, a cache whose
+# test_write_usage_window_refreshes_on_age_floor_when_unchanged — even
+# though the value is IDENTICAL to what's on disk, a window whose
 # fetched_at is already older than the refresh floor must still be
 # rewritten (fetched_at advanced to ~now). Without this, a flat usage
 # window would freeze fetched_at forever, it would eventually age past
@@ -892,71 +991,77 @@ rm -f "$WUC_CACHE"
 # would blank out even though the numbers were never wrong.
 wuc_old_fetched=$(( $(date +%s) - 400 ))
 jq -n --argjson f 9999999999 --argjson fa "$wuc_old_fetched" \
-  '{five_hour:{used_percentage:42,resets_at:$f},seven_day:{used_percentage:30,resets_at:$f},fetched_at:$fa}' > "$WUC_CACHE"
-write_usage_cache 42 9999999999 30 9999999999
-wuc_refreshed_fetched=$(jq -r '.fetched_at' "$WUC_CACHE" 2>/dev/null)
+  '{five_hour:{used_percentage:42,resets_at:$f,fetched_at:$fa}}' > "$WUC_CACHE"
+write_usage_window five_hour 42 9999999999
+wuc_refreshed_fetched=$(jq -r '.five_hour.fetched_at' "$WUC_CACHE" 2>/dev/null)
 [[ "$wuc_refreshed_fetched" != "$wuc_old_fetched" ]] && (( $(date +%s) - wuc_refreshed_fetched < 5 ))
-check "test_write_usage_cache_refreshes_on_age_floor_when_unchanged: unchanged values but stale fetched_at still rewritten" $?
+check "test_write_usage_window_refreshes_on_age_floor_when_unchanged: unchanged value but stale fetched_at still rewritten" $?
 rm -f "$WUC_CACHE"
 
-# A cache younger than the refresh floor (10s old, well under it) with
-# unchanged values must still be left untouched — the floor only forces
-# a write once the cache has actually gone stale-ish, not on every call.
+# A window younger than the refresh floor (10s old, well under it) with
+# an unchanged value must still be left untouched — the floor only forces
+# a write once the window has actually gone stale-ish, not on every call.
 wuc_young_fetched=$(( $(date +%s) - 10 ))
 jq -n --argjson f 9999999999 --argjson fa "$wuc_young_fetched" \
-  '{five_hour:{used_percentage:42,resets_at:$f},seven_day:{used_percentage:30,resets_at:$f},fetched_at:$fa}' > "$WUC_CACHE"
-write_usage_cache 42 9999999999 30 9999999999
-wuc_young_after=$(jq -r '.fetched_at' "$WUC_CACHE" 2>/dev/null)
-assert_eq "test_write_usage_cache_skips_unchanged_within_refresh_floor: 10s-old unchanged cache left untouched" "$wuc_young_fetched" "$wuc_young_after"
+  '{five_hour:{used_percentage:42,resets_at:$f,fetched_at:$fa}}' > "$WUC_CACHE"
+write_usage_window five_hour 42 9999999999
+wuc_young_after=$(jq -r '.five_hour.fetched_at' "$WUC_CACHE" 2>/dev/null)
+assert_eq "test_write_usage_window_skips_unchanged_within_refresh_floor: 10s-old unchanged window left untouched" "$wuc_young_fetched" "$wuc_young_after"
 rm -f "$WUC_CACHE"
 
-# A genuinely different value must still write through.
+# A genuinely different value must still write through, and the SIBLING
+# window (not touched by this call) must be carried forward unchanged.
+jq -n --argjson f 9999999999 --argjson fa "$(( $(date +%s) - 10 ))" \
+  '{five_hour:{used_percentage:42,resets_at:$f,fetched_at:$fa},seven_day:{used_percentage:30,resets_at:$f,fetched_at:$fa}}' > "$WUC_CACHE"
+wuc_seven_before=$(jq -r '.seven_day.fetched_at' "$WUC_CACHE" 2>/dev/null)
 sleep 1
-write_usage_cache 55 9999999999 30 9999999999
-wuc_fetched_3=$(jq -r '.fetched_at' "$WUC_CACHE" 2>/dev/null)
+write_usage_window five_hour 55 9999999999
+wuc_fetched_3=$(jq -r '.five_hour.fetched_at' "$WUC_CACHE" 2>/dev/null)
 wuc_five_3=$(jq -r '.five_hour.used_percentage' "$WUC_CACHE" 2>/dev/null)
-[[ "$wuc_fetched_3" != "$wuc_fetched_2" ]]
-check "test_write_usage_cache_writes_through_on_change: fetched_at updates when a value actually changes" $?
-assert_eq "test_write_usage_cache_writes_through_on_change: new value persisted" "55" "$wuc_five_3"
+wuc_seven_after=$(jq -r '.seven_day.fetched_at' "$WUC_CACHE" 2>/dev/null)
+[[ "$wuc_fetched_3" != "$wuc_seven_before" ]]
+check "test_write_usage_window_writes_through_on_change: fetched_at updates when the value actually changes" $?
+assert_eq "test_write_usage_window_writes_through_on_change: new value persisted" "55" "$wuc_five_3"
+assert_eq "test_write_usage_window_writes_through_on_change: untouched sibling window's fetched_at carried forward unchanged" "$wuc_seven_before" "$wuc_seven_after"
 rm -f "$WUC_CACHE"
 
 # Atomic write: a tmp file + mv, not a direct `> $USAGE_CACHE` redirect
 # (safe today only by luck — a malformed partial write happens to
 # collapse into the anti-fabrication guard — not by design).
 grep -q 'mv ' "$STATUSLINE"
-check "test_write_usage_cache_atomic: write_usage_cache uses tmp file + mv" $?
-grep -A20 '^write_usage_cache() {' "$STATUSLINE" | grep -qE "jq -n.*> \"?\\\$USAGE_CACHE\"?[[:space:]]*2>/dev/null[[:space:]]*$"
-[[ $? -ne 0 ]]; check "test_write_usage_cache_atomic: no direct non-atomic redirect into \$USAGE_CACHE" $?
+check "test_write_usage_window_atomic: write_usage_window uses tmp file + mv" $?
+grep -A30 '^write_usage_window() {' "$STATUSLINE" | grep -qE "jq -n.*> \"?\\\$USAGE_CACHE\"?[[:space:]]*2>/dev/null[[:space:]]*$"
+[[ $? -ne 0 ]]; check "test_write_usage_window_atomic: no direct non-atomic redirect into \$USAGE_CACHE" $?
 
-write_usage_cache 20 9999999999 10 9999999999
-[[ -f "$WUC_CACHE" ]]; check "test_write_usage_cache_atomic: cache file exists after write" $?
+write_usage_window five_hour 20 9999999999
+[[ -f "$WUC_CACHE" ]]; check "test_write_usage_window_atomic: cache file exists after write" $?
 jq -e . "$WUC_CACHE" >/dev/null 2>&1
-check "test_write_usage_cache_atomic: cache file is valid, complete JSON (no partial write left behind)" $?
+check "test_write_usage_window_atomic: cache file is valid, complete JSON (no partial write left behind)" $?
 wuc_tmp_leftover=$(find "$RUNTIME_DIR" -maxdepth 1 -name '.claude_usage_limits_work.json.tmp*' 2>/dev/null)
 [[ -z "$wuc_tmp_leftover" ]]
-check "test_write_usage_cache_atomic: no leftover tmp file after write" $?
+check "test_write_usage_window_atomic: no leftover tmp file after write" $?
 rm -f "$WUC_CACHE"
 
 # test_stdin_unchanged_values_refresh_fetched_at_end_to_end — proves the
-# fix through the whole write-then-read path, not just write_usage_cache
-# in isolation. Seed a cache with fetched_at 400s old and the SAME
-# five_hour value the stdin payload below also carries; the first render
-# must still refresh fetched_at despite the values matching (the age
-# floor forces it). A second render with NO rate_limits on stdin then
+# fix through the whole write-then-read path, not just write_usage_window
+# in isolation. Seed a cache with five_hour.fetched_at 400s old and the
+# SAME value the stdin payload below also carries; the first render must
+# still refresh five_hour's fetched_at despite the value matching (the
+# age floor forces it). A second render with NO rate_limits on stdin then
 # must still show the usage segment, proving fetched_at was genuinely
 # advanced and the 900s read-side bound wasn't tripped.
 rm -f "$GUL_CACHE"
 GUL_E2E_FIVE=$(( $(date +%s) + 3600 ))
 GUL_E2E_OLD_FETCHED=$(( $(date +%s) - 400 ))
 jq -n --argjson f "$GUL_E2E_FIVE" --argjson fa "$GUL_E2E_OLD_FETCHED" \
-  '{five_hour:{used_percentage:66,resets_at:$f},seven_day:{},fetched_at:$fa}' > "$GUL_CACHE"
+  '{five_hour:{used_percentage:66,resets_at:$f,fetched_at:$fa},seven_day:{}}' > "$GUL_CACHE"
 gul_e2e_stdin=$(jq -n --argjson f "$GUL_E2E_FIVE" '{
   workspace: {current_dir: "/tmp"},
   context_window: {used_percentage: 5},
   rate_limits: {five_hour: {used_percentage: 66, resets_at: $f}}
 }')
 printf '%s' "$gul_e2e_stdin" | CLAUDE_CONFIG_DIR="$HOME/.claude" bash "$STATUSLINE" >/dev/null 2>&1
-gul_e2e_fetched=$(jq -r '.fetched_at' "$GUL_CACHE" 2>/dev/null)
+gul_e2e_fetched=$(jq -r '.five_hour.fetched_at' "$GUL_CACHE" 2>/dev/null)
 (( $(date +%s) - gul_e2e_fetched < 5 ))
 check "test_stdin_unchanged_values_refresh_fetched_at_end_to_end: fetched_at refreshed despite unchanged values" $?
 
