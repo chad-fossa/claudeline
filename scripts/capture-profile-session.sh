@@ -24,9 +24,29 @@ detect_account
 # identically (standalone script). See that file for the full rationale
 # (world-writable /tmp squat/symlink surface).
 RUNTIME_DIR="/tmp/claudeline-$(id -u)"
-mkdir -p "$RUNTIME_DIR" 2>/dev/null
-chmod 700 "$RUNTIME_DIR" 2>/dev/null
+mkdir -p -m 700 "$RUNTIME_DIR" 2>/dev/null
 readonly RUNTIME_DIR
+
+# /tmp is world-writable, so mkdir -p above only guarantees SOME directory
+# now exists at this path — not that WE created it or own it. Any process
+# (a co-tenant, or a race before this script's first run) can pre-create
+# /tmp/claudeline-<uid> (the name embeds a uid, not proof of who made it)
+# or swap it for a symlink into a directory it controls; owning that
+# directory means owning every lock/artifact/sentinel/cache claudeline
+# writes under it. Verify ownership (and rule out a symlink, which -d
+# would follow and -O would validate against the SYMLINK TARGET's owner,
+# not the path itself) before trusting anything under RUNTIME_DIR this
+# run. hooks/show-usage-limits.sh + statusline-command.sh inline this
+# identically; scripts/test.sh asserts all three copies match.
+verify_runtime_dir() {
+  RUNTIME_DIR_SAFE=1
+  if [[ -L "$RUNTIME_DIR" || ! -d "$RUNTIME_DIR" || ! -O "$RUNTIME_DIR" ]]; then
+    echo "claudeline: refusing to use ${RUNTIME_DIR} — it isn't a directory we own (pre-created or symlinked by another process); lock/artifact/sentinel/cache writes disabled for this run" >&2
+    RUNTIME_DIR_SAFE=0
+  fi
+}
+verify_runtime_dir
+readonly RUNTIME_DIR_SAFE
 
 # Same lock hooks/show-usage-limits.sh uses for refresh_token_grant and
 # maybe_auto_capture — inlined here byte-identically (standalone script,
@@ -37,6 +57,7 @@ cred_lock_dir() {
 }
 
 acquire_cred_lock() {
+  [[ "$RUNTIME_DIR_SAFE" != "1" ]] && return 1
   local lock_dir
   lock_dir=$(cred_lock_dir)
 

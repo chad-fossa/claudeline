@@ -35,9 +35,29 @@ fi
 # scripts/capture-profile-session.sh inlines this identically (standalone
 # script); scripts/test.sh asserts the two copies match.
 RUNTIME_DIR="/tmp/claudeline-$(id -u)"
-mkdir -p "$RUNTIME_DIR" 2>/dev/null
-chmod 700 "$RUNTIME_DIR" 2>/dev/null
+mkdir -p -m 700 "$RUNTIME_DIR" 2>/dev/null
 readonly RUNTIME_DIR
+
+# /tmp is world-writable, so mkdir -p above only guarantees SOME directory
+# now exists at this path — not that WE created it or own it. Any process
+# (a co-tenant, or a race before this script's first run) can pre-create
+# /tmp/claudeline-<uid> (the name embeds a uid, not proof of who made it)
+# or swap it for a symlink into a directory it controls; owning that
+# directory means owning every lock/artifact/sentinel/cache claudeline
+# writes under it. Verify ownership (and rule out a symlink, which -d
+# would follow and -O would validate against the SYMLINK TARGET's owner,
+# not the path itself) before trusting anything under RUNTIME_DIR this
+# run. scripts/capture-profile-session.sh + statusline-command.sh inline
+# this identically; scripts/test.sh asserts all three copies match.
+verify_runtime_dir() {
+  RUNTIME_DIR_SAFE=1
+  if [[ -L "$RUNTIME_DIR" || ! -d "$RUNTIME_DIR" || ! -O "$RUNTIME_DIR" ]]; then
+    echo "claudeline: refusing to use ${RUNTIME_DIR} — it isn't a directory we own (pre-created or symlinked by another process); lock/artifact/sentinel/cache writes disabled for this run" >&2
+    RUNTIME_DIR_SAFE=0
+  fi
+}
+verify_runtime_dir
+readonly RUNTIME_DIR_SAFE
 
 readonly CACHE_FILE="${RUNTIME_DIR}/.claude_usage_limits_${_ACCT_ID}.json"
 
@@ -98,7 +118,7 @@ get_token() {
 log_malformed_credentials() {
   local creds_file=$1
   echo "${DIM}Usage: ${creds_file} exists but has no usable OAuth token (empty or malformed) — falling back to Keychain${RESET}" >&2
-  printf '%s malformed_or_empty_credentials\n' "$(date +%s)" > "${RUNTIME_DIR}/.claude_cred_malformed_${ACCOUNT_ID}"
+  [[ "$RUNTIME_DIR_SAFE" == "1" ]] && printf '%s malformed_or_empty_credentials\n' "$(date +%s)" > "${RUNTIME_DIR}/.claude_cred_malformed_${ACCOUNT_ID}"
 }
 
 # Decides the fate of a present, well-formed file token: still valid,
@@ -178,6 +198,7 @@ cred_lock_dir() {
 # erased a caller's pre-existing trap in testing. Callers release via
 # release_cred_lock at their own normal exit points.
 acquire_cred_lock() {
+  [[ "$RUNTIME_DIR_SAFE" != "1" ]] && return 1
   local lock_dir
   lock_dir=$(cred_lock_dir)
 
@@ -648,7 +669,10 @@ main() {
   provenance=$(compute_provenance)
   cache_data=$(echo "$usage" | jq --arg ts "$(date +%s)" --arg src "$TOKEN_SOURCE" --arg prov "$provenance" \
     '. + {fetched_at: ($ts | tonumber), token_source: $src, provenance: $prov}')
-  echo "$cache_data" > "$CACHE_FILE"
+  # This render's numbers still print below either way — only the
+  # PERSISTED cache write (read by every later statusline render) is
+  # skipped when RUNTIME_DIR isn't ours; see verify_runtime_dir.
+  [[ "$RUNTIME_DIR_SAFE" == "1" ]] && echo "$cache_data" > "$CACHE_FILE"
 
   # Parse for display
   local five_hour_util seven_day_util reset5 reset7 label5 label7

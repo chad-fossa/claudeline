@@ -15,6 +15,17 @@ RUNTIME_DIR="/tmp/claudeline-$(id -u)"
 mkdir -p "$RUNTIME_DIR" 2>/dev/null
 chmod 700 "$RUNTIME_DIR" 2>/dev/null
 
+# Tests below eval individual functions extracted from the real scripts
+# (rather than running those scripts as subprocesses) — those functions
+# read RUNTIME_DIR_SAFE as a global, which is normally set by each
+# script's own verify_runtime_dir prelude. This harness owns RUNTIME_DIR
+# itself (created just above, no symlink), so it's genuinely safe; set the
+# flag directly since the eval'd functions never run that prelude.
+# Subprocess invocations (bash "$HOOK" / "$CAPTURE" / "$STATUSLINE") are
+# unaffected — they run their own real prelude against this same,
+# genuinely-owned RUNTIME_DIR and derive RUNTIME_DIR_SAFE=1 themselves.
+RUNTIME_DIR_SAFE=1
+
 PASS=0
 FAIL=0
 
@@ -1265,6 +1276,49 @@ CLAUDE_CONFIG_DIR="$RTD_CAP" bash "$CAPTURE" </dev/null >/dev/null 2>&1
 runtime_perms=$(stat -f%Lp "$RUNTIME_DIR" 2>/dev/null || stat -c%a "$RUNTIME_DIR" 2>/dev/null)
 assert_eq "RUNTIME_DIR: capture script creates it 0700" "700" "$runtime_perms"
 rm -rf "$RTD_CAP"
+
+mkdir -p "$RUNTIME_DIR"
+chmod 700 "$RUNTIME_DIR"
+
+# ─────────────────────────────────────────────────────────────
+# Area: RUNTIME_DIR ownership/symlink guard (verify_runtime_dir). A
+# pre-created-by-another-uid directory, or a symlink swapped in before our
+# first mkdir, must be refused loudly (stderr) rather than silently
+# trusted for lock/artifact/sentinel/cache writes.
+# ─────────────────────────────────────────────────────────────
+VRD_SRC=$(extract_func "$STATUSLINE" verify_runtime_dir)
+HOOK_VRD_SRC=$(extract_func "$HOOK" verify_runtime_dir)
+CAPTURE_VRD_SRC=$(extract_func "$CAPTURE" verify_runtime_dir)
+assert_eq "verify_runtime_dir identical in statusline + hook" "$VRD_SRC" "$HOOK_VRD_SRC"
+assert_eq "verify_runtime_dir identical in statusline + capture script" "$VRD_SRC" "$CAPTURE_VRD_SRC"
+
+# Symlink swap: RUNTIME_DIR replaced by a symlink to a directory we
+# genuinely own — still refused, since -L catches the path itself being a
+# symlink regardless of what (or who) it resolves to. mkdir -p -m 700
+# against an existing symlink-to-a-real-dir is a silent no-op (the path
+# "already exists" as far as mkdir -p's stat-following check is
+# concerned) — verify_runtime_dir's own -L check is what has to catch it.
+rm -rf "$RUNTIME_DIR"
+SYMLINK_TARGET=$(mktemp -d)
+ln -s "$SYMLINK_TARGET" "$RUNTIME_DIR"
+
+# Expired file token (not valid-unexpired) forces the hook down the
+# refresh path, which needs acquire_cred_lock — RUNTIME_DIR_SAFE=0 makes
+# that fail immediately (REFRESH_FAIL_REASON=lock_held, a benign silent
+# skip), so this never makes a real network call.
+RTD_SYM_CREDS=$(mktemp -d)
+sym_past_ms=$(( ($(date +%s) - 3600) * 1000 ))
+cat > "$RTD_SYM_CREDS/.credentials.json" <<EOF
+{"claudeAiOauth":{"accessToken":"tok_fake_symlink","refreshToken":"rtok_fake_symlink","expiresAt":$sym_past_ms,"refreshTokenExpiresAt":$((sym_past_ms + 999999999))}}
+EOF
+CLAUDE_CONFIG_DIR="$RTD_SYM_CREDS" bash "$HOOK" </dev/null >/dev/null 2>/tmp/.cll_symlink_stderr
+grep -q "refusing to use" /tmp/.cll_symlink_stderr
+check "symlinked RUNTIME_DIR: refused loudly" $?
+[[ -L "$RUNTIME_DIR" ]]; check "symlinked RUNTIME_DIR: left untouched (still a symlink, not replaced)" $?
+[[ -z "$(ls -A "$SYMLINK_TARGET" 2>/dev/null)" ]]; check "symlinked RUNTIME_DIR: no lock/artifact/cache written into the symlink target" $?
+rm -f /tmp/.cll_symlink_stderr
+rm -rf "$RTD_SYM_CREDS" "$SYMLINK_TARGET"
+rm -f "$RUNTIME_DIR"
 
 mkdir -p "$RUNTIME_DIR"
 chmod 700 "$RUNTIME_DIR"

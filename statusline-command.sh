@@ -84,9 +84,29 @@ fi
 # 0700 runtime dir the hook and capture script use — see
 # hooks/show-usage-limits.sh for the full rationale. Basenames unchanged.
 RUNTIME_DIR="/tmp/claudeline-$(id -u)"
-mkdir -p "$RUNTIME_DIR" 2>/dev/null
-chmod 700 "$RUNTIME_DIR" 2>/dev/null
+mkdir -p -m 700 "$RUNTIME_DIR" 2>/dev/null
 readonly RUNTIME_DIR
+
+# /tmp is world-writable, so mkdir -p above only guarantees SOME directory
+# now exists at this path — not that WE created it or own it. Any process
+# (a co-tenant, or a race before this script's first run) can pre-create
+# /tmp/claudeline-<uid> (the name embeds a uid, not proof of who made it)
+# or swap it for a symlink into a directory it controls; owning that
+# directory means owning every lock/artifact/sentinel/cache claudeline
+# writes under it. Verify ownership (and rule out a symlink, which -d
+# would follow and -O would validate against the SYMLINK TARGET's owner,
+# not the path itself) before trusting anything under RUNTIME_DIR this
+# run. hooks/show-usage-limits.sh + scripts/capture-profile-session.sh
+# inline this identically; scripts/test.sh asserts all three copies match.
+verify_runtime_dir() {
+  RUNTIME_DIR_SAFE=1
+  if [[ -L "$RUNTIME_DIR" || ! -d "$RUNTIME_DIR" || ! -O "$RUNTIME_DIR" ]]; then
+    echo "claudeline: refusing to use ${RUNTIME_DIR} — it isn't a directory we own (pre-created or symlinked by another process); lock/artifact/sentinel/cache writes disabled for this run" >&2
+    RUNTIME_DIR_SAFE=0
+  fi
+}
+verify_runtime_dir
+readonly RUNTIME_DIR_SAFE
 
 # ─────────────────────────────────────────────────────────────
 # Usage limits (read from cache populated by SessionStart hook)
@@ -114,6 +134,7 @@ readonly USAGE_REFRESH_HOOK="$(resolve_usage_refresh_hook)"
 # refreshed data appears on the *next* statusline render. A short-lived
 # lock prevents stampede when multiple renders fire close together.
 maybe_refresh_usage_cache() {
+  [[ "$RUNTIME_DIR_SAFE" != "1" ]] && return
   [[ ! -x "$USAGE_REFRESH_HOOK" ]] && return
 
   local now cache_mtime
@@ -132,6 +153,9 @@ maybe_refresh_usage_cache() {
 }
 
 get_usage_limits() {
+  # A cache under a RUNTIME_DIR we don't own could be attacker-planted —
+  # render no usage segment rather than trust its contents this run.
+  [[ "$RUNTIME_DIR_SAFE" != "1" ]] && return
   if [[ ! -f "$USAGE_CACHE" ]]; then
     return
   fi
@@ -308,6 +332,10 @@ get_branch() {
 }
 
 get_pr_number() {
+  # Same rationale as get_usage_limits/maybe_refresh_usage_cache — skip
+  # the PR cache/lock entirely rather than trust or write to a
+  # RUNTIME_DIR we don't own.
+  [[ "$RUNTIME_DIR_SAFE" != "1" ]] && return
   local repo_name=$1 branch=$2
   local cache="${RUNTIME_DIR}/.claude_pr_cache_${repo_name}_${ACCOUNT_ID}"
   local branch_cache="${RUNTIME_DIR}/.claude_pr_branch_${repo_name}_${ACCOUNT_ID}"
