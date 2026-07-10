@@ -1,36 +1,33 @@
 ---
 name: cache-and-account-contract
-description: Usage-cache schema, account-detection rule, and TTL/lock mechanics shared by statusline-command.sh and hooks/show-usage-limits.sh
+description: v0.7.0 stdin-sourced usage-cache schema, account-detection rule, and PR-cache keying (post credential-subsystem deletion)
 metadata:
   type: reference
 ---
 
-Confirmed against code 2026-07-06.
+Confirmed against code 2026-07-10 (branch cf/v0.7.0-stdin-rate-limits @ 2c32e0b). This entry replaces the pre-v0.7.0 version wholesale — the OAuth-fetch subsystem it described (`hooks/show-usage-limits.sh`, `maybe_refresh_usage_cache`, TTL, `get_token()`) is deleted. See [[v070-stdin-cache-verification]] for the full ship-gate writeup.
 
-**Cache file**: `/tmp/.claude_usage_limits_${ACCOUNT_ID}.json`, written by `hooks/show-usage-limits.sh` (`CACHE_FILE`, line 14) and read by `statusline-command.sh` `get_usage_limits()` (line 74/100-143). Schema: `.five_hour.utilization`, `.five_hour.resets_at`, `.seven_day.utilization`, `.seven_day.resets_at`, plus `.fetched_at` (epoch seconds, added by the hook at write time via `jq --arg ts "$(date +%s)"`, hooks/show-usage-limits.sh:120-122). Values already percentages (15.0 = 15%), not fractions.
+**Source of usage data**: Claude Code ≥2.1.80 hands each session its own usage on the statusline's stdin — `.rate_limits.five_hour.{used_percentage,resets_at}` / `.seven_day.{...}`. `get_usage_limits()` (statusline-command.sh:153-224) reads it straight off `$INPUT`. No fetch, no OAuth, no hook.
 
-**TTL**: 300s (`USAGE_CACHE_TTL_SECONDS`, statusline-command.sh:75). `maybe_refresh_usage_cache()` (lines 82-98) compares `now - file_mtime($CACHE)` against the TTL — it does NOT read `fetched_at` from the JSON for staleness, it uses the file's mtime. A 30s lock file (`/tmp/.claude_usage_refresh_lock_${ACCOUNT_ID}`) prevents stampede; render always shows whatever's on disk now, refreshed data appears next render.
+**Cache file**: `${RUNTIME_DIR}/.claude_usage_limits_${ACCOUNT_ID}.json` (statusline-command.sh:115, `RUNTIME_DIR=/tmp/claudeline-$(id -u)`, not bare `/tmp` — see `verify_runtime_dir`). Written inline and synchronously by `write_usage_cache()` (statusline-command.sh:117-129) whenever stdin carries `rate_limits` — no lock, no background spawn (deliberate per spec; a co-tenant-owned `RUNTIME_DIR` skips the write via `RUNTIME_DIR_SAFE`, same guard as before). Read back by `get_usage_limits()` only when stdin lacks `rate_limits` (pre-first-response renders).
 
-**Account detection rule** (duplicated verbatim-logic in two places — must update both):
-- statusline-command.sh:50-58
-- hooks/show-usage-limits.sh:7-13
+**Schema** mirrors stdin verbatim: `{"five_hour":{"used_percentage":<num>,"resets_at":<epoch int>},"seven_day":{...},"fetched_at":<epoch int>}`. `resets_at` is a raw epoch int now, not the ISO string the old schema held — `parse_iso_utc` is gone, `fmt_epoch` formats the epoch directly (`+%-I%p` lowercased for 5h, `+%m/%d` for 7d).
 
-Rule: `CLAUDE_CONFIG_DIR` substring-matches `"claude-personal"` → `ACCOUNT_ID="personal"`; anything else, including unset, → `ACCOUNT_ID="work"`. This is a default-to-work trap: any config dir that isn't literally named with `claude-personal` in it silently becomes "work", no error surfaced. Chosen deliberately over `transcript_path` because transcript_path follows symlinks and personal→work symlinked projects resolve to `/.claude/` (d9613aa commit message).
+**Staleness = per-window rollover, not TTL.** `USAGE_CACHE_TTL_SECONDS` and `maybe_refresh_usage_cache()` are deleted. Each window's `resets_at` is checked independently against `now` (statusline-command.sh:204-215); an expired 5h window drops only its own segment, 7d renders independently. Anti-fabrication guard survives: cache read gates on `fetched_at` being non-empty/non-null (statusline-command.sh:194) — an old v0.6.x-shaped cache (`utilization` instead of `used_percentage`, ISO `resets_at`) folds to empty via the `// ""` jq defaults and is treated as absent, never a fabricated `0%`. A legit `0%` is distinguishable from absent because jq's `tostring` on `0` yields the non-empty string `"0"`, not `""` — both the stdin-presence check and the cache-read `five_pct` check test for empty-string/`"null"`, not falsiness, so `0` passes through and renders `0%` correctly (verified statusline-command.sh:170, 195, 207).
 
-**get_token() churn** (hooks/show-usage-limits.sh:33-51) — 3 rewrites, extra scrutiny warranted on any future touch:
-1. `89b0c6b` (initial) — simple keychain lookup, single account, no isolation concept yet.
-2. `d9613aa` (2026-03-13) — added multi-account support + a hashed-keychain-entry (`Claude Code-credentials-{hash}`) fallback intended to isolate personal from work. Broken: hashed entries only hold empty-`accessToken` MCP OAuth tokens, and an unanchored grep matched them anyway, silently returning empty/wrong tokens.
-3. `e9295da` (2026-05-10) — reverted the hashed-entry fallback. **~2-month window (2026-03-13 to 2026-05-10) where personal-account usage stats silently failed**, only symptom being a stderr line ("Usage: Could not get credentials" or bad data), no hard error. Forward-fix: always read the single default `Claude Code-credentials` entry, anchor the grep on `"claudeAiOauth":{"accessToken":"..."}`. The macOS keychain single-slot limitation itself (upstream anthropics/claude-code#20553 — last `/login` wins across all profiles) is now documented as a known constraint, not worked around.
-4. `d0c8df7` — added Linux branch: reads `$CLAUDE_CONFIG_DIR/.credentials.json` via `jq` (properly isolated per config dir — Linux has cleaner multi-profile behavior than macOS here). Uses `jq`, not grep, since the file isn't keychain-truncated.
+**Cache write is not atomic** (no tmp+mv, no lock) — a kill mid-`jq -n > file` write can leave a truncated/partial-JSON cache. Not a live bug: a truncated JSON file makes the next render's `jq -r` read fail/produce empty output, which folds to an empty `fetched_at` and is caught by the same anti-fabrication guard (render nothing, not garbage). Flagged as fragile-but-safe-by-construction rather than genuinely robust — an explicit tmp+mv would remove the reliance on jq's failure mode lining up with the guard's empty-string check.
 
-Grep-not-jq on macOS is deliberate: keychain entries with MCP-token bloat can get truncated at keychain's read limit and break JSON parsing; grep degrades gracefully.
+**Account detection rule** — now the SOLE copy, no cross-file sync concern:
+- statusline-command.sh:50-60 (`detect_account()`)
 
-**PR cache keying — RESOLVED, confirmed 2026-07-10.** `get_pr_number()` (statusline-command.sh:279-280) now caches to `/tmp/.claude_pr_cache_${repo_name}_${ACCOUNT_ID}` and `/tmp/.claude_pr_branch_${repo_name}_${ACCOUNT_ID}` — the account-keying fix landed sometime before the v0.6.0 diff (not part of that diff itself). The prior "unkeyed, HIGH-severity leak, dotfiles-vs-repo drift" note below is superseded [?] — repo and dotfiles are now consistent on this point as of this read.
+Rule unchanged: `CLAUDE_CONFIG_DIR` substring-matches `"claude-personal"` → `ACCOUNT_ID="personal"`; anything else, including unset, → `ACCOUNT_ID="work"` (default-to-work trap, same as always).
 
-**BSD/GNU split**: both files branch on `$OSTYPE` for `parse_iso_utc`/`fmt_epoch` (`statusline-command.sh:23-31`, `hooks/show-usage-limits.sh:24-30`); only statusline-command.sh also has `file_mtime` (line 26/30) since only it needs stat. Any new date/stat call must go through these helpers.
+**PR cache keying** — unchanged from the earlier fix, still account-keyed: `get_pr_number()` (statusline-command.sh:328-372) caches to `${RUNTIME_DIR}/.claude_pr_cache_${repo_name}_${ACCOUNT_ID}` and `..._branch_${repo_name}_${ACCOUNT_ID}`. v0.7.0 adds a stdin-first path in `build_output()` (statusline-command.sh:481-504): `.pr.number`/`.pr.url` used when present, `get_pr_number` (with its existing cache/lock) only as fallback.
 
-**Zero test coverage** on this entire surface (statusline-command.sh, hooks/, skills/usage/) — confirmed, no test files found. A framework-level fix is out of scope unless asked; flag any change that could have shipped a regression a test would've caught (e.g. the 2-month get_token() silent failure above — a single test asserting the grep pattern matches a real keychain payload shape would have caught it before merge).
+**BSD/GNU split**: `fmt_epoch`/`file_mtime` still branch on `$OSTYPE` (statusline-command.sh:23-29). `parse_iso_utc` is gone (no ISO strings left to parse).
 
-**skills/usage/** — `SKILL.md` documents `/usage` as a manual re-invocation of `hooks/show-usage-limits.sh` with `'{}'` piped to stdin, sharing the same per-account cache contract as the background refresh path. As of v0.6.0 this invocation is no longer a thin fixed-cost wrapper — it can chain up to three 5s-capped curls (auto-capture identity probe + token refresh + usage fetch) sequentially; see [[v060-render-refresh-cycle]] for the full worst-case-latency breakdown.
+**Test coverage — no longer zero.** `scripts/test.sh` was rewritten for v0.7.0 (436 lines, 58 cases as of 2c32e0b), covering: stdin-usage render+cache, cache-fallback when stdin absent, no-segment-when-nothing-cached, per-window rollover, old-schema-treated-as-absent, stdin-first PR with gh-not-invoked / gh-fallback-invoked, `shared_login_marker`/`profile_uuid_state`, assumed-account dimming, RUNTIME_DIR creation + ownership/symlink guard, install.sh artifact/hooks-key absence, and full-tree dead-reference grep-verify. This retires the "zero test coverage" flag that applied to every prior claudeline-core review.
 
-Related: [[hardcoded-hook-path]], [[v060-render-refresh-cycle]]
+**skills/usage/** — `SKILL.md` and `CLAUDE.md` rewritten as a no-op explainer: usage arrives automatically on stdin each render, nothing to force-refresh; blank until the session's first API response.
+
+Related: [[hardcoded-hook-path]] (moot — hook deleted), [[v060-render-refresh-cycle]] (describes the deleted subsystem, historical only), [[v070-stdin-cache-verification]]

@@ -5,6 +5,8 @@ metadata:
   type: project
 ---
 
+**[SUPERSEDED as of v0.7.0, 2026-07-10]** Everything below (hook credential subsystem, `maybe_auto_capture`, `capture-profile-session.sh`, `refresh_token_grant`, the credential lock, `.bak` rotation) was deleted in v0.7.0 — CC ≥2.1.80 sends usage on stdin, no fetch/refresh/capture needed. Kept as history of what was reviewed and why it was believed safe at the time. Current state: [[v070_stdin_rate_limits_review]].
+
 2026-07-10, branch `cf/v0.6.0-file-first-credentials`, HEAD `7f71fbd`. Verified
 each condition from [[v060_auto_capture_trigger_review]] against the actual
 committed code (not just the diff) plus a live `bash scripts/test.sh` run

@@ -5,6 +5,8 @@ metadata:
   type: reference
 ---
 
+**[SUPERSEDED as of v0.7.0, 2026-07-10]** `hooks/show-usage-limits.sh` no longer exists — usage is stdin-sourced, nothing left to fetch. The recipe below is history/context only. Current replacement recipe (constructs and confirms the residual assumed-account cache-write leak, not the dead keychain one) lives in [[v070_stdin_rate_limits_review]] Verdict 5 — it was executed live against HEAD 2c32e0b and reproduced end-to-end.
+
 Never accept "should be fine" as a conclusion for a cross-profile leak claim — run this and diff the output:
 
 ```

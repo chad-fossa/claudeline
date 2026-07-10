@@ -5,6 +5,8 @@ metadata:
   type: project
 ---
 
+**[SUPERSEDED as of v0.7.0, 2026-07-10]** Auto-capture, the keychain-mdat veto, `profileFetchedAt`/`captured_login_at`, and the whole credential-capture flow this reviews are DELETED in v0.7.0 — usage is stdin-sourced now, no capture needed. Kept as history. Current state: [[v070_stdin_rate_limits_review]].
+
 2026-07-10 consult on the not-yet-built v0.6.0 auto-capture design (branch
 `cf/v0.6.0-file-first-credentials`, executor mid-build). Trigger: capture
 fires when `.claude.json`'s `.oauthAccount.profileFetchedAt` differs from

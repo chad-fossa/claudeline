@@ -5,6 +5,8 @@ metadata:
   type: reference
 ---
 
+**SUPERSEDED 2026-07-10 [?]** — v0.7.0 (2c32e0b) deletes the entire subsystem this file documents (`hooks/show-usage-limits.sh`, `scripts/capture-profile-session.sh`, auto-capture, `refresh_token_grant`, credential lock hand-off). None of it exists in the current tree. Kept for history only — see [[v070-stdin-cache-verification]] for the current render/refresh cycle.
+
 ## FINAL: re-verified 2026-07-10, HEAD `98416f1`, `PASS: 197 FAIL: 0` — SHIP-READY
 
 The CRITICAL auto-capture self-deadlock documented below (found against `7929916`) is
