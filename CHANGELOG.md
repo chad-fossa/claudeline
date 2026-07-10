@@ -15,9 +15,28 @@ This is pre-1.0, so the removal below ships as a MINOR per this project's own ve
 - **Deleted from `statusline-command.sh`**: `maybe_refresh_usage_cache`, `resolve_usage_refresh_hook`/`USAGE_REFRESH_HOOK`, `USAGE_CACHE_TTL_SECONDS`, `parse_iso_utc`, `unverifiable_marker` and its `?`/`!` markers, `token_source`/`provenance` cache fields.
 - **Deleted from `install.sh`/`settings-example.json`**: the hook/capture-script downloads and the `hooks.SessionStart` wiring. Statusline + the `/usage` skill are the only artifacts installed now.
 - **Markers**: `?` (unverifiable) and `!` (refresh-failed) are gone — there's no fetch-time credential state left to flag. The dim `=` marker (both profiles logged into the same account) stays, since it reads `.claude.json` directly and has nothing to do with usage fetching.
-- **Cache schema**: mirrors stdin verbatim now — `{five_hour:{used_percentage,resets_at},seven_day:{...},fetched_at}`, with `resets_at` as a raw epoch int instead of an ISO string. An old v0.6.x-shaped cache is unrecognized and treated as absent (never renders a fabricated `0%`); the next stdin-carrying render overwrites it.
+- **Cache schema**: mirrors stdin verbatim now — `{five_hour:{used_percentage,resets_at,fetched_at},seven_day:{...}}`, with `resets_at` as a raw epoch int instead of an ISO string. `fetched_at` lives inside each window, not at the top level, and is stamped only when that window's value arrives on stdin this render — a window carried forward from cache keeps its original `fetched_at`. Freshness is checked per window (own read-side max age, own write-side refresh floor), so one window's activity can never make its sibling look fresher than it is; a single file-global `fetched_at` used to let a busy `five_hour` keep a stale `seven_day` looking current forever. Keeping the original stamp on carry-forward is also what makes concurrent same-account renders safe — a clobbered value keeps its true age instead of being reborn as fresh. An old v0.6.x-shaped cache, or a v0.7.0-prerelease cache with a top-level `fetched_at`, both read back with no per-window stamp — treated as unfresh, rendered as blank (never a fabricated `0%`), and replaced (not migrated) on the next stdin-carrying render.
 - **Requirements**: Claude Code ≥2.1.80, and a Claude.ai Pro or Max plan (usage limits don't apply otherwise). Usage is blank until the session's first API response, same as before — but on some Claude.ai Max/OAuth configurations `rate_limits` never arrives on stdin at all ([anthropics/claude-code#40094](https://github.com/anthropics/claude-code/issues/40094), [#45133](https://github.com/anthropics/claude-code/issues/45133)); there's no fallback for that case since claudeline no longer fetches usage on its own.
-- **Migration**: remove the deleted scripts and the credential artifacts they left behind, for every profile you run (`~/.claude`, `~/.claude-personal`, …):
+- **Migration**: remove the deleted scripts, the `settings.json` entry that invoked them, and the credential artifacts they left behind, for every profile you run (`~/.claude`, `~/.claude-personal`, …).
+
+  First, drop the `show-usage-limits.sh` entries from `hooks.SessionStart` in each profile's `settings.json` — installing v0.7.0 doesn't touch an *existing* `settings.json`, so an already-installed profile is left invoking a deleted script on every session start and compact. This only removes the matching entries; any other hooks you have in the same block (e.g. an unrelated `SessionStart` hook) are left in place, and `hooks` is only dropped entirely if nothing else is left under it:
+  ```bash
+  for f in ~/.claude/settings.json ~/.claude-personal/settings.json; do
+    [[ -f "$f" ]] || continue
+    jq '
+      .hooks.SessionStart = [
+        (.hooks.SessionStart // [])[]
+        | .hooks |= map(select(.command | test("show-usage-limits\\.sh") | not))
+        | select((.hooks | length) > 0)
+      ]
+      | if (.hooks.SessionStart | length) == 0 then .hooks |= del(.SessionStart) else . end
+      | if (.hooks | length) == 0 then del(.hooks) else . end
+    ' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+  done
+  ```
+  You lose the session-start usage banner. That's fine: it printed the same 5-hour/7-day numbers the statusline now shows continuously and correctly per session — and it read the single shared Keychain slot, so on a second profile it printed the *first* profile's numbers. Removing it removes the last place that cross-profile bug could surface.
+
+  Then remove the deleted scripts and the credential artifacts they left behind:
   ```bash
   rm -f ~/.claude/hooks/show-usage-limits.sh ~/.claude*/scripts/capture-profile-session.sh
   rm -f ~/.claude/.credentials.json.bak ~/.claude-personal/.credentials.json.bak
@@ -34,6 +53,12 @@ This is pre-1.0, so the removal below ships as a MINOR per this project's own ve
 
 ### Fixes
 - **PR number**: now read from stdin (`.pr.number`/`.pr.url`) when Claude Code already resolved it for the session, falling back to the existing `gh pr view` lookup only when stdin doesn't carry a PR.
+- **Context window size validation**: A non-numeric `context_window_size` on stdin reached bash arithmetic unvalidated. Now validated the same way `used_percentage` already was; an invalid value falls back to the 200000 default instead.
+- **Non-git folder name**: A directory name containing terminal escape sequences rendered them raw in the non-git statusline format — the one stdin-derived string not already run through the control-character stripper. Now stripped like every other one.
+- **PR cache under a guessed account**: A session with `CLAUDE_CONFIG_DIR` unset (an assumed identity) still persisted PR data. It still renders a PR live via `gh`, it just no longer writes the PR cache/branch-cache/lock files under a guess — matching the usage cache's existing refusal.
+- **Usage cache freshness, per window**: A single file-global `fetched_at` let a busy `five_hour` keep the whole cache looking fresh, so a stale `seven_day` could render as current indefinitely. Freshness (and its own refresh floor) is now tracked per window (see the Breaking section's Cache schema entry). The cache writer also no longer re-reads its sibling window off disk before writing, closing a race where two concurrent same-account renders could resurrect a stale value under a fresh timestamp.
+
+  The stdin channel these four items harden is Claude Code's own — not attacker-reachable input — so treat them as hardening, not fixes for a live exploit.
 
 ## v0.6.1 (2026-07-10)
 
