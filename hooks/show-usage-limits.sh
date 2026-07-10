@@ -189,7 +189,13 @@ read_keychain_mdat_epoch() {
   local raw ts
   raw=$(security find-generic-password -s "Claude Code-credentials" 2>/dev/null)
   [[ -z "$raw" ]] && return 1
-  ts=$(echo "$raw" | grep '"mdat"' | grep -o '"[0-9]\{14\}Z"' | head -1 | tr -d '"')
+  # Real `security` output embeds a raw NUL right after the timestamp
+  # (e.g. "mdat"<timedate>=0x...  "20260710042146Z\0"); bash's command
+  # substitution above already strips it on capture, so match the bare
+  # digits+Z run rather than depending on exact quote/whitespace
+  # placement afterward — -a is defense-in-depth for any shell that
+  # doesn't strip it, verified against a real macOS Keychain entry.
+  ts=$(echo "$raw" | grep -a '"mdat"' | grep -a -o '[0-9]\{14\}Z' | head -1)
   [[ -z "$ts" ]] && return 1
   if [[ "$OSTYPE" == "darwin"* ]]; then
     TZ=UTC date -jf "%Y%m%d%H%M%SZ" "$ts" "+%s" 2>/dev/null

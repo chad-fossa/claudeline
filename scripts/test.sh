@@ -341,22 +341,29 @@ epoch_to_mdat_ts() {
   fi
 }
 
+# Emits a REAL embedded NUL byte after the timestamp (via printf directly
+# to stdout, not through a bash variable — bash can't hold a NUL in a
+# string) to faithfully reproduce real `security` output, which embeds a
+# raw NUL there — verified against this machine's actual Keychain entry.
+# bash's command substitution strips it on capture; read_keychain_mdat_
+# epoch()'s unanchored digits+Z match plus -a is defense-in-depth on top
+# of that, not the only thing making this work.
 AUTOSEC=$(mktemp -d)
 cat > "$AUTOSEC/security" <<'EOF'
 #!/bin/bash
 for arg in "$@"; do
   [[ "$arg" == "-w" ]] && { echo '{"claudeAiOauth":{"accessToken":"tok_fake_should_not_be_read"}}'; exit 0; }
 done
-cat <<MDATEOF
-keychain: "/tmp/fake.keychain-db"
-version: 512
-class: "genp"
-attributes:
-    0x00000007 <blob>="Claude Code-credentials"
-    "acct"<blob>="fakeacct"
-    "cdat"<timestamp>="${MDAT_TS}"
-    "mdat"<timestamp>="${MDAT_TS}"
-MDATEOF
+printf 'keychain: "/tmp/fake.keychain-db"\n'
+printf 'version: 512\n'
+printf 'class: "genp"\n'
+printf 'attributes:\n'
+printf '    0x00000007 <blob>="Claude Code-credentials"\n'
+printf '    "acct"<blob>="fakeacct"\n'
+printf '    "cdat"<timedate>=0x00000000000000000000000000000000  "%s' "$MDAT_TS"
+printf '\0"\n'
+printf '    "mdat"<timedate>=0x00000000000000000000000000000000  "%s' "$MDAT_TS"
+printf '\0"\n'
 EOF
 chmod +x "$AUTOSEC/security"
 export PATH="$AUTOSEC:$PATH"
