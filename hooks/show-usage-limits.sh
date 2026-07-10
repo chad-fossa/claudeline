@@ -234,6 +234,38 @@ refresh_token_grant() {
   return 0
 }
 
+# Computes this profile's provenance ONCE, at fetch/cache-write time,
+# instead of statusline recomputing it on every render (that render-path
+# recomputation — file_provenance_matches, now deleted from
+# statusline-command.sh — cost an extra jq spawn plus a second file read
+# on every single statusline paint). Same match semantics as that
+# function had: this profile's .credentials.json claudeline.
+# verified_account_uuid vs this profile's .claude.json accountUuid.
+# Returns one of three explicit strings (never exit-code-style 0/1 — that
+# inversion was a standing trap in the old file_provenance_matches/prov
+# pairing, where 0 meant "match" against every other 0=false convention
+# in this codebase):
+#   verified_match — verified_account_uuid present and equals profile uuid
+#   mismatch       — verified_account_uuid present but differs
+#   unverified     — no verified capture yet (missing file/field), or a
+#                     pre-existing cache with no provenance field at all
+compute_provenance() {
+  local creds_file="${_CREDS_DIR}/.credentials.json"
+  local claude_json="${_CREDS_DIR}/.claude.json"
+
+  local verified_uuid profile_uuid
+  verified_uuid=$(jq -r '.claudeline.verified_account_uuid // empty' "$creds_file" 2>/dev/null)
+  profile_uuid=$(jq -r '.oauthAccount.accountUuid // empty' "$claude_json" 2>/dev/null)
+
+  if [[ -z "$verified_uuid" ]]; then
+    echo "unverified"
+  elif [[ -n "$profile_uuid" && "$verified_uuid" == "$profile_uuid" ]]; then
+    echo "verified_match"
+  else
+    echo "mismatch"
+  fi
+}
+
 # Reads the "Claude Code-credentials" keychain item's modification date
 # WITHOUT -w (metadata only, never the secret payload) and returns it as
 # epoch seconds. Used only for the auto-capture corroboration window
@@ -445,10 +477,12 @@ main() {
     exit 0
   fi
 
-  # Write to cache file with timestamp
-  local cache_data
-  cache_data=$(echo "$usage" | jq --arg ts "$(date +%s)" --arg src "$TOKEN_SOURCE" \
-    '. + {fetched_at: ($ts | tonumber), token_source: $src}')
+  # Write to cache file with timestamp + provenance (computed once here,
+  # not per-render — see compute_provenance).
+  local cache_data provenance
+  provenance=$(compute_provenance)
+  cache_data=$(echo "$usage" | jq --arg ts "$(date +%s)" --arg src "$TOKEN_SOURCE" --arg prov "$provenance" \
+    '. + {fetched_at: ($ts | tonumber), token_source: $src, provenance: $prov}')
   echo "$cache_data" > "$CACHE_FILE"
 
   # Parse for display

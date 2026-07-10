@@ -704,91 +704,50 @@ marker=$(shared_login_marker "differ")
 assert_eq "differ state -> no shared-login marker" "" "$marker"
 
 OSTYPE="darwin24"
-marker=$(unverifiable_marker "differ")
+marker=$(unverifiable_marker "differ" "unknown" "unverified")
 assert_eq "darwin + differ -> ? marker" " ${DIM}?${RESET}" "$marker"
 
-marker=$(unverifiable_marker "equal")
+marker=$(unverifiable_marker "equal" "unknown" "unverified")
 assert_eq "darwin + equal -> no ? marker" "" "$marker"
 
-marker=$(unverifiable_marker "single")
+marker=$(unverifiable_marker "single" "unknown" "unverified")
 assert_eq "darwin + single -> no ? marker" "" "$marker"
 
-marker=$(unverifiable_marker "unknown")
+marker=$(unverifiable_marker "unknown" "unknown" "unverified")
 assert_eq "darwin + unknown -> no ? marker" "" "$marker"
 
 OSTYPE="linux-gnu"
-marker=$(unverifiable_marker "differ")
+marker=$(unverifiable_marker "differ" "unknown" "unverified")
 assert_eq "linux + differ -> no ? marker (darwin-only)" "" "$marker"
 
 OSTYPE="darwin24"
 RED=$'\033[31m'
 
-# token_source-aware suppression: file+matching provenance suppresses ?,
-# file+mismatch keeps it, unknown/keychain behave like v0.5.0, and
-# file-refresh-failed always renders ! regardless of state/provenance.
-marker=$(unverifiable_marker "differ" "file" "0")
-assert_eq "token_source=file + provenance match -> no ? marker" "" "$marker"
+# token_source/provenance-aware suppression: file+verified_match
+# suppresses ?, file+mismatch/unverified keeps it, unknown/keychain
+# behave like v0.5.0, and file-refresh-failed always renders !
+# regardless of state/provenance. provenance is now one of the explicit
+# strings verified_match|mismatch|unverified (never exit-code-style 0/1).
+marker=$(unverifiable_marker "differ" "file" "verified_match")
+assert_eq "token_source=file + provenance=verified_match -> no ? marker" "" "$marker"
 
-marker=$(unverifiable_marker "differ" "file" "1")
-assert_eq "token_source=file + provenance mismatch -> ? stays" " ${DIM}?${RESET}" "$marker"
+marker=$(unverifiable_marker "differ" "file" "mismatch")
+assert_eq "token_source=file + provenance=mismatch -> ? stays" " ${DIM}?${RESET}" "$marker"
 
-marker=$(unverifiable_marker "differ" "unknown" "1")
+marker=$(unverifiable_marker "differ" "unknown" "unverified")
 assert_eq "token_source=unknown -> ? per v0.5.0" " ${DIM}?${RESET}" "$marker"
 
-marker=$(unverifiable_marker "differ" "keychain" "1")
+marker=$(unverifiable_marker "differ" "keychain" "unverified")
 assert_eq "token_source=keychain -> ? per v0.5.0" " ${DIM}?${RESET}" "$marker"
 
-marker=$(unverifiable_marker "equal" "file-refresh-failed" "1")
+marker=$(unverifiable_marker "equal" "file-refresh-failed" "unverified")
 assert_eq "token_source=file-refresh-failed -> ! marker" " ${DIM}${RED}!${RESET}" "$marker"
 
-# captured_for_uuid alone (provenance_ok=1, i.e. file_provenance_matches
-# returned false because verified_account_uuid is absent) must never
-# suppress ? even when token_source=file — this is the hard expert
-# condition Task 6 fixes.
-marker=$(unverifiable_marker "differ" "file" "1")
-assert_eq "token_source=file + captured_for_uuid-only (unverified) -> ? stays, suppression never fires on captured_for_uuid alone" " ${DIM}?${RESET}" "$marker"
-
-# ─────────────────────────────────────────────────────────────
-# Area: file_provenance_matches (verified_account_uuid vs profile uuid —
-# captured_for_uuid is forensics-only and must NEVER gate this)
-# ─────────────────────────────────────────────────────────────
-FPM_SRC=$(extract_func "$STATUSLINE" file_provenance_matches)
-eval "$FPM_SRC"
-
-FPM_DIR=$(mktemp -d)
-FPM_PERSONAL="$FPM_DIR/claude-personal"
-mkdir -p "$FPM_PERSONAL"
-
-ACCOUNT_ID="personal"
-CLAUDE_CONFIG_DIR="$FPM_PERSONAL"
-
-echo '{"oauthAccount":{"accountUuid":"uuid-match"}}' > "$FPM_PERSONAL/.claude.json"
-echo '{"claudeAiOauth":{"accessToken":"tok_fake_fpm"},"claudeline":{"captured_for_uuid":"uuid-match","verified_account_uuid":"uuid-match"}}' > "$FPM_PERSONAL/.credentials.json"
-file_provenance_matches
-check "file_provenance_matches: matching verified_account_uuid -> true" $?
-
-echo '{"claudeAiOauth":{"accessToken":"tok_fake_fpm"},"claudeline":{"captured_for_uuid":"uuid-match","verified_account_uuid":"uuid-other"}}' > "$FPM_PERSONAL/.credentials.json"
-file_provenance_matches
-result=$?
-[[ "$result" != "0" ]]; check "file_provenance_matches: mismatched verified_account_uuid -> false" $?
-
-echo '{"claudeAiOauth":{"accessToken":"tok_fake_fpm"},"claudeline":{"captured_for_uuid":"uuid-match"}}' > "$FPM_PERSONAL/.credentials.json"
-file_provenance_matches
-result=$?
-[[ "$result" != "0" ]]; check "file_provenance_matches: captured_for_uuid alone (no verified_account_uuid) -> false, never suppresses" $?
-
-echo '{"claudeAiOauth":{"accessToken":"tok_fake_fpm"}}' > "$FPM_PERSONAL/.credentials.json"
-file_provenance_matches
-result=$?
-[[ "$result" != "0" ]]; check "file_provenance_matches: no claudeline block -> false" $?
-
-rm -f "$FPM_PERSONAL/.credentials.json"
-file_provenance_matches
-result=$?
-[[ "$result" != "0" ]]; check "file_provenance_matches: no credentials file -> false" $?
-
-rm -rf "$FPM_DIR"
-unset ACCOUNT_ID CLAUDE_CONFIG_DIR
+# provenance=unverified (no verified capture yet — e.g. captured_for_uuid
+# stamped but never probed) must never suppress ? even when
+# token_source=file — this is the hard expert condition Task 6 fixes.
+marker=$(unverifiable_marker "differ" "file" "unverified")
+assert_eq "token_source=file + provenance=unverified -> ? stays, suppression never fires without a verified capture" " ${DIM}?${RESET}" "$marker"
 
 # ─────────────────────────────────────────────────────────────
 # Area: get_usage_limits cold-start / warm-cache gating (C5 — cold start
@@ -825,6 +784,52 @@ echo "$gul_out2" | grep -q '42%'
 check "warm-cache refresh failure: stale numbers still render" $?
 echo "$gul_out2" | grep -q '!'
 check "warm-cache refresh failure: ! marker still renders" $?
+
+# get_usage_limits composition: cache seeded with each provenance/
+# token_source combo -> assert the exact ? marker behavior in the FULL
+# statusline printf output (covers the cache-fold -> unverifiable_marker
+# wiring end to end, not just the isolated function). Needs
+# profile_uuid_state()="differ" so ? is even eligible to render.
+echo '{"oauthAccount":{"accountUuid":"gul-work-uuid"}}' > "$HOME/.claude/.claude.json"
+echo '{"oauthAccount":{"accountUuid":"gul-personal-uuid"}}' > "$HOME/.claude-personal/.claude.json"
+
+cat > "/tmp/.claude_usage_limits_personal.json" <<EOF
+{"five_hour":{"utilization":10},"seven_day":{"utilization":5},"fetched_at":$(date +%s),"token_source":"file","provenance":"verified_match"}
+EOF
+gul_out3=$(echo '{"workspace":{"current_dir":"/tmp"},"context_window":{"used_percentage":7}}' | CLAUDE_CONFIG_DIR="$GUL_CONFIG_DIR" bash "$STATUSLINE" 2>/dev/null)
+echo "$gul_out3" | grep -q '?'
+[[ $? -ne 0 ]]; check "composition: token_source=file + provenance=verified_match -> no ? marker" $?
+
+cat > "/tmp/.claude_usage_limits_personal.json" <<EOF
+{"five_hour":{"utilization":10},"seven_day":{"utilization":5},"fetched_at":$(date +%s),"token_source":"file","provenance":"mismatch"}
+EOF
+gul_out4=$(echo '{"workspace":{"current_dir":"/tmp"},"context_window":{"used_percentage":7}}' | CLAUDE_CONFIG_DIR="$GUL_CONFIG_DIR" bash "$STATUSLINE" 2>/dev/null)
+echo "$gul_out4" | grep -q '?'
+check "composition: token_source=file + provenance=mismatch -> ? marker present" $?
+
+# Pre-existing cache with no provenance field at all -> defaults to
+# unverified -> ? stays (missing-field case Task 3 requires).
+cat > "/tmp/.claude_usage_limits_personal.json" <<EOF
+{"five_hour":{"utilization":10},"seven_day":{"utilization":5},"fetched_at":$(date +%s),"token_source":"file"}
+EOF
+gul_out5=$(echo '{"workspace":{"current_dir":"/tmp"},"context_window":{"used_percentage":7}}' | CLAUDE_CONFIG_DIR="$GUL_CONFIG_DIR" bash "$STATUSLINE" 2>/dev/null)
+echo "$gul_out5" | grep -q '?'
+check "composition: pre-existing cache with no provenance field -> defaults unverified, ? marker present" $?
+
+# token_source=keychain + provenance=verified_match -> ? still stays;
+# the file+verified_match suppression path is keyed on token_source
+# being exactly "file", never keychain.
+cat > "/tmp/.claude_usage_limits_personal.json" <<EOF
+{"five_hour":{"utilization":10},"seven_day":{"utilization":5},"fetched_at":$(date +%s),"token_source":"keychain","provenance":"verified_match"}
+EOF
+gul_out6=$(echo '{"workspace":{"current_dir":"/tmp"},"context_window":{"used_percentage":7}}' | CLAUDE_CONFIG_DIR="$GUL_CONFIG_DIR" bash "$STATUSLINE" 2>/dev/null)
+echo "$gul_out6" | grep -q '?'
+check "composition: token_source=keychain -> ? marker present regardless of provenance" $?
+
+# restore equal-state fixture (matches the profile_uuid_state area's
+# final state) in case anything downstream assumes it
+echo '{"oauthAccount":{"accountUuid":"same-uuid"}}' > "$HOME/.claude/.claude.json"
+echo '{"oauthAccount":{"accountUuid":"same-uuid"}}' > "$HOME/.claude-personal/.claude.json"
 
 rm -f "/tmp/.claude_usage_limits_personal.json"
 rm -rf "$GUL_DIR"

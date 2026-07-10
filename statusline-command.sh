@@ -125,19 +125,37 @@ get_usage_limits() {
     return
   fi
 
+  # Single jq invocation for every field this function needs (fetched_at
+  # gate, the two utilizations + reset times, token_source, and
+  # provenance — the last two used to be a separate jq call plus a whole
+  # extra file read via file_provenance_matches, now deleted; provenance
+  # is computed once at cache-write time by the hook's compute_provenance
+  # instead). A missing provenance field (a pre-existing cache from
+  # before this changed) defaults to "unverified", same as a fresh
+  # unverified capture — the ? marker stays, per v0.5.0.
+  # \x01 (not @tsv's tab) on purpose: bash's `read` classifies tab as
+  # "IFS whitespace" no matter what IFS is set to, so it squashes/strips
+  # LEADING and consecutive tabs — silently misaligning every field
+  # whenever fetched_at (the first, often-empty, field) is empty. \x01
+  # isn't whitespace, so empty leading/middle fields read correctly.
+  local fetched_at five_hour seven_day reset5 reset7 token_source provenance
+  IFS=$'\x01' read -r fetched_at five_hour seven_day reset5 reset7 token_source provenance < <(
+    jq -r '[
+      (.fetched_at // ""),
+      (.five_hour.utilization // 0),
+      (.seven_day.utilization // 0),
+      (.five_hour.resets_at // ""),
+      (.seven_day.resets_at // ""),
+      (.token_source // "unknown"),
+      (.provenance // "unverified")
+    ] | map(tostring) | join("\u0001")' "$USAGE_CACHE" 2>/dev/null
+  )
+
   # A cache written only by handle_refresh_failure's cold-start artifact
   # (pre-fix) or any cache missing fetched_at/five_hour has no real usage
-  # data — jq's `// 0` below would otherwise render a fabricated "0%".
+  # data — jq's `// 0` above would otherwise render a fabricated "0%".
   # Gate on fetched_at directly instead of trusting the defaulted values.
-  local fetched_at
-  fetched_at=$(jq -r '.fetched_at // empty' "$USAGE_CACHE" 2>/dev/null)
   [[ -z "$fetched_at" ]] && return
-
-  local five_hour seven_day reset5 reset7
-  five_hour=$(jq -r '.five_hour.utilization // 0' "$USAGE_CACHE" 2>/dev/null)
-  seven_day=$(jq -r '.seven_day.utilization // 0' "$USAGE_CACHE" 2>/dev/null)
-  reset5=$(jq -r '.five_hour.resets_at // empty' "$USAGE_CACHE" 2>/dev/null)
-  reset7=$(jq -r '.seven_day.resets_at // empty' "$USAGE_CACHE" 2>/dev/null)
 
   if [[ -z "$five_hour" || "$five_hour" == "null" ]]; then
     return
@@ -170,12 +188,8 @@ get_usage_limits() {
   ((pct7 >= 80)) && color7=$RED
   ((pct7 >= 50 && pct7 < 80)) && color7=$YELLOW
 
-  local token_source prov
-  token_source=$(jq -r '.token_source // "unknown"' "$USAGE_CACHE" 2>/dev/null)
-  if file_provenance_matches; then prov=0; else prov=1; fi
-
   local unverifiable
-  unverifiable=$(unverifiable_marker "$(profile_uuid_state)" "$token_source" "$prov")
+  unverifiable=$(unverifiable_marker "$(profile_uuid_state)" "$token_source" "$provenance")
 
   printf '%s%s:%s%s%d%%%s %s%s:%s%s%d%%%s %s│%s%s' "$DIM" "$label5" "$RESET" "$color5" "$pct5" "$RESET" "$DIM" "$label7" "$RESET" "$color7" "$pct7" "$RESET" "$DIM" "$RESET" "$unverifiable"
 }
@@ -405,51 +419,30 @@ shared_login_marker() {
   [[ "$state" == "equal" ]] && printf '%s=%s' "$DIM" "$RESET"
 }
 
-# True only when this profile's .credentials.json carries a VERIFIED
-# identity for this exact profile — i.e. its claudeline.verified_account_uuid
-# matches this profile's .claude.json accountUuid. verified_account_uuid is
-# only ever written after an identity probe confirms the captured token's
-# real owner (scripts/capture-profile-session.sh Task 7). captured_for_uuid
-# is forensics-only: the capture script stamps its OWN profile's uuid by
-# construction, so a mis-capture trivially satisfies captured_for_uuid ==
-# profile_uuid — it must NEVER gate this. A file with no claudeline block,
-# no verified_account_uuid (unverified capture), or a mismatched uuid
-# returns false.
-file_provenance_matches() {
-  local creds_dir
-  if [[ "$ACCOUNT_ID" == "personal" ]]; then
-    creds_dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude-personal}"
-  else
-    creds_dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
-  fi
-
-  local creds_file="$creds_dir/.credentials.json"
-  local claude_json="$creds_dir/.claude.json"
-  [[ -f "$creds_file" && -f "$claude_json" ]] || return 1
-
-  local verified_uuid profile_uuid
-  verified_uuid=$(jq -r '.claudeline.verified_account_uuid // empty' "$creds_file" 2>/dev/null)
-  profile_uuid=$(jq -r '.oauthAccount.accountUuid // empty' "$claude_json" 2>/dev/null)
-
-  [[ -n "$verified_uuid" && -n "$profile_uuid" && "$verified_uuid" == "$profile_uuid" ]]
-}
-
-# state: profile_uuid_state() result. token_source/provenance_ok default to
-# pre-0.6.0 values so old 1-arg callers keep today's darwin+differ behavior.
-# file-refresh-failed always wins (stale numbers + broken refresh, distinct
-# from the cross-profile-ambiguity ?). file+VERIFIED identity (provenance_ok
-# from file_provenance_matches, which keys on verified_account_uuid, never
-# captured_for_uuid alone) suppresses ? — anything else (mismatch, unknown,
-# keychain, unverified capture) renders it exactly as v0.5.0 did.
+# state: profile_uuid_state() result. token_source/provenance are read
+# straight from the usage cache (get_usage_limits' single jq fold) — both
+# are computed once by the hook at fetch/cache-write time
+# (compute_provenance in hooks/show-usage-limits.sh), not recomputed
+# per-render (that used to cost an extra jq spawn plus a second file read
+# via the now-deleted file_provenance_matches). provenance is one of the
+# explicit strings verified_match | mismatch | unverified — never
+# exit-code-style 0/1, which was a standing inversion trap (0 read as
+# "match" here, opposite of 0=false everywhere else). file-refresh-failed
+# always wins (stale numbers + broken refresh, distinct from the
+# cross-profile-ambiguity ?). file+verified_match suppresses ? — anything
+# else (mismatch, unverified — including a pre-existing cache with no
+# provenance field, which get_usage_limits defaults to "unverified" —
+# unknown, keychain) renders it exactly as v0.5.0 did. No arg defaults:
+# every caller passes state/token_source/provenance explicitly.
 unverifiable_marker() {
-  local state=$1 token_source=${2:-unknown} provenance_ok=${3:-1}
+  local state=$1 token_source=$2 provenance=$3
 
   if [[ "$token_source" == "file-refresh-failed" ]]; then
     printf ' %s%s!%s' "$DIM" "$RED" "$RESET"
     return
   fi
 
-  [[ "$token_source" == "file" && "$provenance_ok" == "0" ]] && return
+  [[ "$token_source" == "file" && "$provenance" == "verified_match" ]] && return
 
   [[ "$OSTYPE" == darwin* && "$state" == "differ" ]] && printf ' %s?%s' "$DIM" "$RESET"
 }
