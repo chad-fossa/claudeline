@@ -367,10 +367,13 @@ read_keychain_mdat_epoch() {
   [[ -z "$raw" ]] && return 1
   # Real `security` output embeds a raw NUL right after the timestamp
   # (e.g. "mdat"<timedate>=0x...  "20260710042146Z\0"); bash's command
-  # substitution above already strips it on capture, so match the bare
-  # digits+Z run rather than depending on exact quote/whitespace
-  # placement afterward — -a is defense-in-depth for any shell that
-  # doesn't strip it, verified against a real macOS Keychain entry.
+  # substitution does NOT strip that NUL. What actually makes this safe
+  # is the anchored `grep -a -o '[0-9]\{14\}Z'`: it pulls out only the
+  # bare digits+Z run regardless of what NUL/quote/whitespace surrounds
+  # it, so the embedded NUL never has to be handled explicitly — -a just
+  # keeps grep from treating the NUL-containing line as binary and
+  # refusing to match at all. Verified against a real macOS Keychain
+  # entry.
   ts=$(echo "$raw" | grep -a '"mdat"' | grep -a -o '[0-9]\{14\}Z' | head -1)
   [[ -z "$ts" ]] && return 1
   if [[ "$OSTYPE" == "darwin"* ]]; then
@@ -382,10 +385,11 @@ read_keychain_mdat_epoch() {
 
 # Prefers this profile's own capture script (sibling of _CREDS_DIR, mirrors
 # resolve_usage_refresh_hook()'s CLAUDE_CONFIG_DIR-first resolution),
-# falling back to the work install. install.sh does not currently ship
-# scripts/capture-profile-session.sh, so this commonly falls through to a
-# path that doesn't exist — maybe_auto_capture treats that as a loud,
-# non-fatal skip, not an error.
+# falling back to the work install. install.sh ships
+# scripts/capture-profile-session.sh under both install paths, but a
+# profile installed before that (or by some other means) can still lack
+# it — maybe_auto_capture treats a missing script at the resolved path as
+# a loud, non-fatal skip, not an error.
 resolve_capture_script() {
   local preferred="${_CREDS_DIR}/scripts/capture-profile-session.sh"
   if [[ -f "$preferred" ]]; then
@@ -425,7 +429,7 @@ record_capture_attempt() {
 # can't close it — timestamp proximity on one shared mutable resource
 # can't prove causal ownership between two independent event streams.
 # That residual is accepted; a real identity probe happens downstream in
-# capture-profile-session.sh itself (Task 7).
+# capture-profile-session.sh itself (verify_capture_identity).
 # Wraps the whole check+veto+invoke in the SAME lock refresh_token_grant
 # uses, so auto-capture and an in-flight refresh can't race the file.
 # Capture failure (missing script, capture script's own exit != 0) never

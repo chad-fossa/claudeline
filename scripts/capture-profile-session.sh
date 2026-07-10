@@ -111,13 +111,13 @@ if [[ -z "$oauth_blob" || "$oauth_blob" == "null" ]]; then
   exit 1
 fi
 
-# Identity verification probe (Task 7). Confirms the keychain session we're
-# about to capture actually belongs to THIS profile's account before we
-# stamp it as verified — captured_for_uuid alone (the profile's own uuid,
+# Identity verification probe. Confirms the keychain session we're about
+# to capture actually belongs to THIS profile's account before we stamp
+# it as verified — captured_for_uuid alone (the profile's own uuid,
 # stamped by construction) can never prove that; only an independent
 # server-side lookup of the token's real owner can. Sets VERIFY_STATUS to
-# one of: verified | mismatch | unverified. Kept in one place (this script)
-# so hooks/show-usage-limits.sh's auto-capture trigger (Task 8) calls this
+# one of: verified | mismatch | unverified. Kept in one place (this
+# script) so hooks/show-usage-limits.sh's auto-capture trigger calls this
 # script rather than duplicating the probe.
 verify_capture_identity() {
   local token=$1 expect_uuid=$2

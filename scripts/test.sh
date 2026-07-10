@@ -435,7 +435,7 @@ assert_eq "fetch_usage: header file is chmod 600" "600" "$(cat "$FUCURL/hdr_perm
 rm -rf "$FUCURL"
 
 # ─────────────────────────────────────────────────────────────
-# Area: maybe_auto_capture (Task 8 — "/login is all I do"). Trigger is a
+# Area: maybe_auto_capture ("/login is all I do"). Trigger is a
 # value-delta on .oauthAccount.profileFetchedAt (never mtime — see
 # multi-profile-isolation review), gated by a TWO-SIDED corroboration
 # window against the keychain item's mdat (a one-sided window is
@@ -469,9 +469,10 @@ epoch_to_mdat_ts() {
 # to stdout, not through a bash variable — bash can't hold a NUL in a
 # string) to faithfully reproduce real `security` output, which embeds a
 # raw NUL there — verified against this machine's actual Keychain entry.
-# bash's command substitution strips it on capture; read_keychain_mdat_
-# epoch()'s unanchored digits+Z match plus -a is defense-in-depth on top
-# of that, not the only thing making this work.
+# bash's command substitution does NOT strip that NUL; what makes
+# read_keychain_mdat_epoch() safe is its anchored digits+Z grep pattern,
+# which pulls out just the timestamp regardless of what NUL/quote noise
+# surrounds it — see the comment in hooks/show-usage-limits.sh itself.
 AUTOSEC=$(mktemp -d)
 cat > "$AUTOSEC/security" <<'EOF'
 #!/bin/bash
@@ -720,7 +721,8 @@ rmdir "${RUNTIME_DIR}/.claude_cred_lock_personal" 2>/dev/null
 # ─────────────────────────────────────────────────────────────
 # Area: capture-profile-session.sh (manual provenance-stamped capture +
 # identity verification probe, user-run only — never invoked by hook/
-# statusline directly; the hook shells out to this script in Task 8)
+# statusline directly; the hook shells out to this script from
+# maybe_auto_capture)
 # ─────────────────────────────────────────────────────────────
 CAP_DIR=$(mktemp -d)
 CAPSEC=$(mktemp -d)
@@ -730,7 +732,7 @@ echo '{"claudeAiOauth":{"accessToken":"tok_fake_capture","refreshToken":"rtok_fa
 EOF
 chmod +x "$CAPSEC/security"
 
-# curl stub for the Task 7 identity probe (api/oauth/profile) — keyed on
+# curl stub for the identity probe (api/oauth/profile) — keyed on
 # PROFILE_HTTP_CODE / PROFILE_RESPONSE_BODY env vars per scenario. Also
 # logs argv + any -H @file contents so tests can assert the probe token
 # never appears in argv but IS delivered via the header file.
@@ -821,7 +823,7 @@ echo "$cap_out3" | grep -q "tok_fake_capture"
 rm -f "${RUNTIME_DIR}/.claude_cred_capture_vetoed_personal"
 
 # Probe timeout/non-200 -> file WRITTEN but usable-unverified (no
-# verified_account_uuid/verified_at) -> ? stays per Task 6.
+# verified_account_uuid/verified_at) -> ? stays (unverifiable_marker).
 CAP_CONFIG_DIR4="$CAP_DIR/claude-personal-unverified"
 mkdir -p "$CAP_CONFIG_DIR4"
 echo '{"oauthAccount":{"accountUuid":"profile-uuid-abc","profileFetchedAt":1783657301823}}' > "$CAP_CONFIG_DIR4/.claude.json"
@@ -940,7 +942,7 @@ assert_eq "token_source=file-refresh-failed -> ! marker" " ${DIM}${RED}!${RESET}
 
 # provenance=unverified (no verified capture yet — e.g. captured_for_uuid
 # stamped but never probed) must never suppress ? even when
-# token_source=file — this is the hard expert condition Task 6 fixes.
+# token_source=file — this is the hard condition unverifiable_marker enforces.
 marker=$(unverifiable_marker "differ" "file" "unverified")
 assert_eq "token_source=file + provenance=unverified -> ? stays, suppression never fires without a verified capture" " ${DIM}?${RESET}" "$marker"
 
@@ -1003,7 +1005,7 @@ echo "$gul_out4" | grep -q '?'
 check "composition: token_source=file + provenance=mismatch -> ? marker present" $?
 
 # Pre-existing cache with no provenance field at all -> defaults to
-# unverified -> ? stays (missing-field case Task 3 requires).
+# unverified -> ? stays (missing-field default in get_usage_limits).
 cat > "${RUNTIME_DIR}/.claude_usage_limits_personal.json" <<EOF
 {"five_hour":{"utilization":10},"seven_day":{"utilization":5},"fetched_at":$(date +%s),"token_source":"file"}
 EOF

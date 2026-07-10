@@ -127,7 +127,7 @@ Auto-capture's trigger depends on `.claude.json`'s `oauthAccount.profileFetchedA
 CLAUDE_CONFIG_DIR=$HOME/.claude-personal scripts/capture-profile-session.sh
 ```
 
-This runs the same identity-verified capture auto-capture uses, synchronously, with output on stdout (never prints the token itself).
+This runs the same identity-verified capture auto-capture uses, synchronously, with output on stdout (never prints the token itself). It shares the same credential lock as `refresh_token_grant` and auto-capture, so if one of those is mid-refresh/capture for this account, the manual run exits 1 with a message instead of racing it — just try again in a moment.
 
 ### Cross-profile identity markers
 
