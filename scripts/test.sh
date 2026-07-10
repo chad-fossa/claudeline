@@ -6,9 +6,29 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STATUSLINE="$REPO_ROOT/statusline-command.sh"
 INSTALL="$REPO_ROOT/install.sh"
 
+# RUNTIME_DIR is hardcoded in statusline-command.sh as /tmp/claudeline-$(id -u)
+# — no test-only env-var backdoor allowed in production code. Without this
+# shim the harness computed that SAME path as the real, live uid, so every
+# run raced the user's actual statusline (which writes that directory on
+# every prompt) and deleted its cache mid-suite. A PATH-shimmed `id` (same
+# idiom already used below for `gh`) makes both this script's own `id -u`
+# and every `bash "$STATUSLINE"` subprocess's internal `id -u` resolve to
+# one synthetic, run-unique uid, so the harness and the script under test
+# land on the same isolated dir — and never on the real one.
+IDSHIM_DIR=$(mktemp -d)
+CLAUDELINE_TEST_UID="9$$"
+cat > "$IDSHIM_DIR/id" << EOF
+#!/bin/bash
+[[ "\$1" == "-u" ]] && { echo "$CLAUDELINE_TEST_UID"; exit 0; }
+exec /usr/bin/id "\$@"
+EOF
+chmod +x "$IDSHIM_DIR/id"
+export PATH="$IDSHIM_DIR:$PATH"
+
 # Same per-user 0700 runtime dir the scripts under test create themselves —
 # tests that manually pre-seed/inspect an artifact/lock/cache file (rather
-# than going through the real script) need this path to match exactly.
+# than going through the real script) need this path to match exactly. The
+# shim above guarantees it is the synthetic dir, never the real uid's.
 RUNTIME_DIR="/tmp/claudeline-$(id -u)"
 mkdir -p "$RUNTIME_DIR" 2>/dev/null
 chmod 700 "$RUNTIME_DIR" 2>/dev/null
@@ -78,7 +98,7 @@ done
 # Isolated $HOME fixture — never touch the real machine's profiles
 # ─────────────────────────────────────────────────────────────
 TEST_HOME=$(mktemp -d)
-cleanup() { rm -rf "$TEST_HOME"; }
+cleanup() { rm -rf "$TEST_HOME" "$RUNTIME_DIR" "$IDSHIM_DIR"; }
 trap cleanup EXIT
 export HOME="$TEST_HOME"
 mkdir -p "$HOME/.claude" "$HOME/.claude-personal"
