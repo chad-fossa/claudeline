@@ -116,6 +116,13 @@ readonly USAGE_CACHE="${RUNTIME_DIR}/.claude_usage_limits_${ACCOUNT_ID}.json"
 
 write_usage_cache() {
   [[ "$RUNTIME_DIR_SAFE" != "1" ]] && return
+  # Never persist a GUESSED identity's numbers — same refusal the
+  # deleted refresh_token_grant made on ACCOUNT_ASSUMED. An env-less
+  # session that guesses "work" and writes its own usage into the work
+  # cache file poisons a later, genuinely-detected work session, which
+  # would then render the guess as its own numbers, undimmed. Rendering
+  # from stdin this run is unaffected — only the write is gated.
+  ((ACCOUNT_ASSUMED)) && return
   local five_pct=$1 five_reset=$2 seven_pct=$3 seven_reset=$4
   jq -n \
     --argjson five_pct "${five_pct:-null}" \
@@ -192,6 +199,15 @@ get_usage_limits() {
       ] | map(tostring) | join("")' "$USAGE_CACHE" 2>/dev/null
     )
     [[ -z "$fetched_at" || "$fetched_at" == "null" ]] && return
+    [[ "$fetched_at" =~ ^[0-9]+$ ]] || return
+
+    # Recency bound: a cache older than this never renders, even though
+    # fetched_at itself is valid — 900s comfortably covers the
+    # pre-first-response window across a session restart while still
+    # guaranteeing yesterday's numbers can never render as current.
+    local cache_age_secs=$(( $(date +%s) - fetched_at ))
+    ((cache_age_secs > 900)) && return
+
     [[ -z "$five_pct" || "$five_pct" == "null" ]] && return
   fi
 

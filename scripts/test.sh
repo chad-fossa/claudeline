@@ -271,6 +271,56 @@ echo "$gul_out5" | grep -Eq '(^|[^0-9])0%'
 rm -f "$GUL_CACHE"
 
 # ─────────────────────────────────────────────────────────────
+# Area: C1 — cross-profile leak (write guard + read-side recency bound).
+# Live-reproduced: an env-less session (ACCOUNT_ASSUMED=1, ACCOUNT_ID
+# guessed "work") wrote its own numbers into the shared work cache file;
+# a later REAL work session then rendered the guessed numbers
+# undimmed. The guess must never reach disk — rendering from stdin is
+# unaffected, only the WRITE is gated. Separately, a cache read with no
+# age bound could render arbitrarily stale numbers as current.
+# ─────────────────────────────────────────────────────────────
+rm -f "$GUL_CACHE"
+GUL_A_FIVE=$(( $(date +%s) + 3600 ))
+GUL_A_SEVEN=$(( $(date +%s) + 86400 ))
+stdin_assumed_json=$(jq -n --argjson f "$GUL_A_FIVE" --argjson s "$GUL_A_SEVEN" '{
+  workspace: {current_dir: "/tmp"},
+  context_window: {used_percentage: 5},
+  rate_limits: {
+    five_hour: {used_percentage: 77, resets_at: $f},
+    seven_day: {used_percentage: 88, resets_at: $s}
+  }
+}')
+gul_a_out=$(printf '%s' "$stdin_assumed_json" | env -u CLAUDE_CONFIG_DIR bash "$STATUSLINE" 2>/dev/null)
+[[ ! -f "$GUL_CACHE" ]]; check "test_assumed_account_never_writes_cache: no cache file written on a guessed identity" $?
+echo "$gul_a_out" | grep -q '77%'
+check "test_assumed_account_never_writes_cache: render still shows 5h numbers from stdin" $?
+echo "$gul_a_out" | grep -q '88%'
+check "test_assumed_account_never_writes_cache: render still shows 7d numbers from stdin" $?
+rm -f "$GUL_CACHE"
+
+# test_stale_cache_beyond_max_age_no_usage_segment
+GUL_STALE_FETCHED=$(( $(date +%s) - 1200 ))
+GUL_STALE_FIVE=$(( $(date +%s) + 3600 ))
+jq -n --argjson f "$GUL_STALE_FIVE" --argjson fa "$GUL_STALE_FETCHED" \
+  '{five_hour:{used_percentage:42,resets_at:$f},seven_day:{used_percentage:33,resets_at:$f},fetched_at:$fa}' > "$GUL_CACHE"
+gul_b_out=$(printf '%s' "$NO_RATE_LIMITS_JSON" | CLAUDE_CONFIG_DIR="$HOME/.claude" bash "$STATUSLINE" 2>/dev/null)
+echo "$gul_b_out" | grep -q '42%'
+[[ $? -ne 0 ]]; check "test_stale_cache_beyond_max_age_no_usage_segment: 5h segment dropped" $?
+echo "$gul_b_out" | grep -q '33%'
+[[ $? -ne 0 ]]; check "test_stale_cache_beyond_max_age_no_usage_segment: 7d segment dropped" $?
+rm -f "$GUL_CACHE"
+
+# test_fresh_cache_within_max_age_renders
+GUL_FRESH_FETCHED=$(( $(date +%s) - 60 ))
+GUL_FRESH_FIVE=$(( $(date +%s) + 3600 ))
+jq -n --argjson f "$GUL_FRESH_FIVE" --argjson fa "$GUL_FRESH_FETCHED" \
+  '{five_hour:{used_percentage:42,resets_at:$f},seven_day:{used_percentage:33,resets_at:$f},fetched_at:$fa}' > "$GUL_CACHE"
+gul_c_out=$(printf '%s' "$NO_RATE_LIMITS_JSON" | CLAUDE_CONFIG_DIR="$HOME/.claude" bash "$STATUSLINE" 2>/dev/null)
+echo "$gul_c_out" | grep -q '42%'
+check "test_fresh_cache_within_max_age_renders: 1-minute-old cache still renders" $?
+rm -f "$GUL_CACHE"
+
+# ─────────────────────────────────────────────────────────────
 # Area: PR — stdin-first, gh fallback
 # ─────────────────────────────────────────────────────────────
 PRSTDIN_DIR=$(mktemp -d)
