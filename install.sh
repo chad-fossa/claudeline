@@ -28,6 +28,7 @@ esac
 # Create directories
 mkdir -p "$CLAUDE_DIR/hooks"
 mkdir -p "$CLAUDE_DIR/skills/usage"
+mkdir -p "$CLAUDE_DIR/scripts"
 
 # Download files
 echo "  Downloading statusline-command.sh..."
@@ -40,6 +41,10 @@ chmod +x "$CLAUDE_DIR/hooks/show-usage-limits.sh"
 
 echo "  Downloading usage skill..."
 curl -fsSL "$REPO/skills/usage/SKILL.md" -o "$CLAUDE_DIR/skills/usage/SKILL.md"
+
+echo "  Downloading capture-profile-session.sh..."
+curl -fsSL "$REPO/scripts/capture-profile-session.sh" -o "$CLAUDE_DIR/scripts/capture-profile-session.sh"
+chmod +x "$CLAUDE_DIR/scripts/capture-profile-session.sh"
 
 # Merge into settings.json
 SETTINGS="$CLAUDE_DIR/settings.json"

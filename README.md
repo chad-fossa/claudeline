@@ -52,6 +52,7 @@ Three components, one cache file per account.
 | `statusline-command.sh` | Renders the statusline every prompt. Reads context from Claude's JSON input (uses pre-calculated `used_percentage` when available), usage from cache. |
 | `hooks/show-usage-limits.sh` | Fetches usage from Anthropic's API at session start and after compaction. Writes to `/tmp/.claude_usage_limits_<account>.json`. |
 | `skills/usage/SKILL.md` | Adds a `/usage` slash command to refresh on demand. |
+| `scripts/capture-profile-session.sh` | Copies the Keychain session into this profile's own credentials file, identity-verified. Auto-invoked by the hook after `/login` (macOS) — see [Per-profile credentials](#per-profile-credentials-macos). |
 
 Usage is fetched only when it matters -- not on every render. The hook writes, the statusline reads.
 
@@ -192,11 +193,12 @@ git clone https://github.com/chad-fossa/claudeline.git
 cd claudeline
 
 cp statusline-command.sh ~/.claude/
-mkdir -p ~/.claude/hooks ~/.claude/skills/usage
+mkdir -p ~/.claude/hooks ~/.claude/skills/usage ~/.claude/scripts
 cp hooks/show-usage-limits.sh ~/.claude/hooks/
 cp skills/usage/SKILL.md ~/.claude/skills/usage/
+cp scripts/capture-profile-session.sh ~/.claude/scripts/
 
-chmod +x ~/.claude/statusline-command.sh ~/.claude/hooks/show-usage-limits.sh
+chmod +x ~/.claude/statusline-command.sh ~/.claude/hooks/show-usage-limits.sh ~/.claude/scripts/capture-profile-session.sh
 ```
 
 Then merge `settings-example.json` into your `~/.claude/settings.json`.
