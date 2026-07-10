@@ -191,8 +191,8 @@ verify_capture_identity() {
   [[ "$http_code" != "200" ]] && return 0
   echo "$payload" | jq -e . >/dev/null 2>&1 || return 0
 
-  PROBE_UUID=$(echo "$payload" | jq -r '.uuid // .account_uuid // empty')
-  PROBE_EMAIL=$(echo "$payload" | jq -r '.email // "unknown"')
+  PROBE_UUID=$(echo "$payload" | jq -r '.account.uuid // .uuid // .account_uuid // empty')
+  PROBE_EMAIL=$(echo "$payload" | jq -r '.account.email // .email // empty')
   [[ -z "$PROBE_UUID" ]] && return 0
 
   if [[ "$PROBE_UUID" == "$expect_uuid" ]]; then
