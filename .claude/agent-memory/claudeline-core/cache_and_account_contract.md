@@ -25,12 +25,12 @@ Rule: `CLAUDE_CONFIG_DIR` substring-matches `"claude-personal"` → `ACCOUNT_ID=
 
 Grep-not-jq on macOS is deliberate: keychain entries with MCP-token bloat can get truncated at keychain's read limit and break JSON parsing; grep degrades gracefully.
 
-**PR cache is unkeyed by account** — `get_pr_number()` (statusline-command.sh:247-288) caches to `/tmp/.claude_pr_cache_${repo_name}` and `/tmp/.claude_pr_branch_${repo_name}`, keyed only by repo name. Two profiles working the same repo share one PR cache — confirmed still true in current code, standing HIGH-severity leak, not this expert's call to fix without multi-profile-isolation's diagnosis per the cluster split, though the fix (rekey by `${repo_name}_${ACCOUNT_ID}`) lands in this expert's file when authorized. Note: the domain-bootstrap research claims the user's separate dotfiles copy of statusline-command.sh already has this fix (account-keyed PR cache) — this repo's copy does not; treat dotfiles-vs-repo drift as real until reconciled.
+**PR cache keying — RESOLVED, confirmed 2026-07-10.** `get_pr_number()` (statusline-command.sh:279-280) now caches to `/tmp/.claude_pr_cache_${repo_name}_${ACCOUNT_ID}` and `/tmp/.claude_pr_branch_${repo_name}_${ACCOUNT_ID}` — the account-keying fix landed sometime before the v0.6.0 diff (not part of that diff itself). The prior "unkeyed, HIGH-severity leak, dotfiles-vs-repo drift" note below is superseded [?] — repo and dotfiles are now consistent on this point as of this read.
 
 **BSD/GNU split**: both files branch on `$OSTYPE` for `parse_iso_utc`/`fmt_epoch` (`statusline-command.sh:23-31`, `hooks/show-usage-limits.sh:24-30`); only statusline-command.sh also has `file_mtime` (line 26/30) since only it needs stat. Any new date/stat call must go through these helpers.
 
 **Zero test coverage** on this entire surface (statusline-command.sh, hooks/, skills/usage/) — confirmed, no test files found. A framework-level fix is out of scope unless asked; flag any change that could have shipped a regression a test would've caught (e.g. the 2-month get_token() silent failure above — a single test asserting the grep pattern matches a real keychain payload shape would have caught it before merge).
 
-**skills/usage/** — `SKILL.md` documents `/usage` as a manual re-invocation of `hooks/show-usage-limits.sh` with `'{}'` piped to stdin, sharing the same per-account cache contract as the background refresh path. Not yet deep-read line-by-line; treat as thin wrapper around the same hook until a diff touches it.
+**skills/usage/** — `SKILL.md` documents `/usage` as a manual re-invocation of `hooks/show-usage-limits.sh` with `'{}'` piped to stdin, sharing the same per-account cache contract as the background refresh path. As of v0.6.0 this invocation is no longer a thin fixed-cost wrapper — it can chain up to three 5s-capped curls (auto-capture identity probe + token refresh + usage fetch) sequentially; see [[v060-render-refresh-cycle]] for the full worst-case-latency breakdown.
 
-Related: [[hardcoded-hook-path]]
+Related: [[hardcoded-hook-path]], [[v060-render-refresh-cycle]]

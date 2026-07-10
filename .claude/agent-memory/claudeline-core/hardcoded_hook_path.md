@@ -7,8 +7,10 @@ metadata:
 
 Confirmed against code 2026-07-06.
 
-`USAGE_REFRESH_HOOK="$HOME/.claude/hooks/show-usage-limits.sh"` (statusline-command.sh:76) is hardcoded — it does not respect `CLAUDE_CONFIG_DIR`. Ranked MEDIUM severity in the domain-bootstrap research, mitigated (not eliminated) by the fact that the hook itself re-derives `ACCOUNT_ID`/`_CREDS_DIR` at runtime from `CLAUDE_CONFIG_DIR` (hooks/show-usage-limits.sh:7-13), so even though the *invoking path* is fixed to the work install, the *credentials/cache it acts on* still follow the caller's env. Net effect: works correctly as long as `$HOME/.claude/hooks/show-usage-limits.sh` is the canonical hook copy for all profiles (true today per install.sh, owned by claudeline-distribution) — would break if a profile needed a genuinely different hook version.
+**RESOLVED, confirmed 2026-07-10** — as of the current code, `statusline-command.sh` no longer hardcodes the hook path. `resolve_usage_refresh_hook()` (statusline-command.sh:91-98) prefers `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/show-usage-limits.sh` and only falls back to the work install (`$HOME/.claude/hooks/...`) if the profile-local one isn't executable; `USAGE_REFRESH_HOOK` (statusline-command.sh:99) is set from that. This fix predates the v0.6.0 diff (not part of it) — the account-scoping gap this memory originally described is closed. Superseded entry below kept for history [?].
+
+~~`USAGE_REFRESH_HOOK="$HOME/.claude/hooks/show-usage-limits.sh"` (statusline-command.sh:76) is hardcoded — it does not respect `CLAUDE_CONFIG_DIR`.~~ Ranked MEDIUM severity in the domain-bootstrap research at the time; mitigation reasoning (hook re-derives `ACCOUNT_ID`/`_CREDS_DIR` from `CLAUDE_CONFIG_DIR` regardless of invoking path) no longer needed now that the path itself is profile-aware.
 
 Low confidence overall on this cluster: only 7 commits touch it (below the ~30-commit weak-signal floor per team's Init convention), so treat conclusions here as provisional pending more history.
 
-Related: [[cache-and-account-contract]]
+Related: [[cache-and-account-contract]], [[v060-render-refresh-cycle]]

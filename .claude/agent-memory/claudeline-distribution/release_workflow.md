@@ -27,7 +27,16 @@ Confirmed against CLAUDE.md 2026-07-06.
 **Backfilling tags:** `git tag -a vX.Y.Z <commit-sha> -m "vX.Y.Z (backfilled)"` —
 must target the commit matching the changelog content, not latest HEAD.
 
-At map time (2026-07-06 per domain-bootstrap.json), open thread: 0d6ae13 +
+[?] At map time (2026-07-06 per domain-bootstrap.json), open thread: 0d6ae13 +
 v0.4.0 tag were unpushed, and a `feat/linux-support` branch was superseded but
-not cleaned up. Worth re-checking current repo state before assuming these are
-resolved — they were noted by the researcher pass, not independently verified here.
+not cleaned up. As of 2026-07-10, tags v0.1.0 through v0.5.0 all exist locally
+and the repo has progressed to a v0.6.0 CHANGELOG draft (untagged, pre-ship) —
+this thread looks resolved but push status to the actual remote wasn't
+re-verified this session; check `git push --dry-run` / remote tags before
+trusting either state.
+
+v0.6.0 ship-gate (2026-07-10): CHANGELOG.md has a full v0.6.0 dated section
+but no `chore(release): v0.6.0` commit or `v0.6.0` tag yet — correctly still
+pre-ship per this repo's convention (CHANGELOG edits land before the release
+commit/tag, not after). See [[v060_capture_script_distribution_gap]] for a
+blocking finding fixed during this pass.
