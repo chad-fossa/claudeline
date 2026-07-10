@@ -340,11 +340,15 @@ RESOLVE_WINDOW_SRC=$(extract_func "$STATUSLINE" resolve_window)
 RENDER_SEG_SRC=$(extract_func "$STATUSLINE" render_usage_segment)
 READ_CACHED_WINDOW_SRC=$(extract_func "$STATUSLINE" read_cached_window)
 WINDOW_CACHE_FRESH_SRC=$(extract_func "$STATUSLINE" window_cache_fresh)
-WRITE_USAGE_WINDOW_SRC=$(extract_func "$STATUSLINE" write_usage_window)
+WINDOW_WRITE_TRIPLE_SRC=$(extract_func "$STATUSLINE" window_write_triple)
+WRITE_USAGE_CACHE_SRC=$(extract_func "$STATUSLINE" write_usage_cache)
+PERSIST_USAGE_WINDOWS_SRC=$(extract_func "$STATUSLINE" persist_usage_windows)
 eval "$RENDER_SEG_SRC"
 eval "$READ_CACHED_WINDOW_SRC"
 eval "$WINDOW_CACHE_FRESH_SRC"
-eval "$WRITE_USAGE_WINDOW_SRC"
+eval "$WINDOW_WRITE_TRIPLE_SRC"
+eval "$WRITE_USAGE_CACHE_SRC"
+eval "$PERSIST_USAGE_WINDOWS_SRC"
 eval "$RESOLVE_WINDOW_SRC"
 eval "$RESOLVE_VALUES_SRC"
 eval "$GUL_FUNC_SRC"
@@ -743,7 +747,7 @@ rm -rf "$GHSTUB2" "$PRSTDIN_DIR"
 
 # ─────────────────────────────────────────────────────────────
 # Area: PR-cache never persists under a guessed identity. Mirrors the
-# write_usage_window guard above — get_pr_number had no ACCOUNT_ASSUMED
+# write_usage_cache guard above — get_pr_number had no ACCOUNT_ASSUMED
 # guard on its cache/branch-cache/lock writes.
 # ─────────────────────────────────────────────────────────────
 PRASSUMED_DIR=$(mktemp -d)
@@ -977,89 +981,190 @@ pr_jq_spawns=$(grep -c "jq -r '.pr\." "$STATUSLINE")
 assert_eq "test_pr_fields_folded_into_one_jq_call: no separate .pr.number/.pr.url jq spawns remain" "0" "$pr_jq_spawns"
 
 # ─────────────────────────────────────────────────────────────
-# Area: C3 — write_usage_window skips unchanged writes, writes
-# atomically, and stamps ITS OWN fetched_at only (see FIX3 above for the
-# cross-window isolation this per-window design exists for).
+# Area: C3 — window_write_triple decides skip/refresh/carry-forward per
+# window (the age-floor + unchanged-value logic that used to live inside
+# write_usage_window itself, back when it re-read the sibling off disk).
+# write_usage_cache is the single atomic disk write it feeds; neither
+# function reads the cache — resolve_usage_values reads it exactly once
+# and threads the values through (see the race test below).
 # ─────────────────────────────────────────────────────────────
 READ_CACHED_WINDOW_SRC=$(extract_func "$STATUSLINE" read_cached_window)
-WRITE_USAGE_WINDOW_SRC=$(extract_func "$STATUSLINE" write_usage_window)
+WINDOW_CACHE_FRESH_SRC=$(extract_func "$STATUSLINE" window_cache_fresh)
+WINDOW_WRITE_TRIPLE_SRC=$(extract_func "$STATUSLINE" window_write_triple)
+WRITE_USAGE_CACHE_SRC=$(extract_func "$STATUSLINE" write_usage_cache)
+PERSIST_USAGE_WINDOWS_SRC=$(extract_func "$STATUSLINE" persist_usage_windows)
 eval "$READ_CACHED_WINDOW_SRC"
-eval "$WRITE_USAGE_WINDOW_SRC"
+eval "$WINDOW_CACHE_FRESH_SRC"
+eval "$WINDOW_WRITE_TRIPLE_SRC"
+eval "$WRITE_USAGE_CACHE_SRC"
+eval "$PERSIST_USAGE_WINDOWS_SRC"
 WUC_CACHE="${RUNTIME_DIR}/.claude_usage_limits_work.json"
 rm -f "$WUC_CACHE"
 ACCOUNT_ID=work
 ACCOUNT_ASSUMED=0
 USAGE_CACHE="$WUC_CACHE"
 
-# Seed an initial write, then call again with an IDENTICAL value — the
-# window's fetched_at must be left untouched (currently rewrites on every
-# render; was <=1/300s before this project's v0.6.x throttle).
-write_usage_window five_hour 42 9999999999
-wuc_fetched_1=$(jq -r '.five_hour.fetched_at' "$WUC_CACHE" 2>/dev/null)
-sleep 1
-write_usage_window five_hour 42 9999999999
-wuc_fetched_2=$(jq -r '.five_hour.fetched_at' "$WUC_CACHE" 2>/dev/null)
-assert_eq "test_write_usage_window_skips_unchanged: fetched_at untouched when the value is identical" "$wuc_fetched_1" "$wuc_fetched_2"
-rm -f "$WUC_CACHE"
+# From stdin, value unchanged from cache, cache still within the 300s
+# floor — carries forward the CACHE's own fetched_at, never "now".
+wuc_recent_fetched=$(( $(date +%s) - 10 ))
+IFS=$'\x01' read -r wt1_pct wt1_reset wt1_fetched < <(window_write_triple 1 42 9999999999 42 9999999999 "$wuc_recent_fetched")
+assert_eq "test_window_write_triple_skips_unchanged_within_floor: fetched_at carried forward, not refreshed" "$wuc_recent_fetched" "$wt1_fetched"
 
-# test_write_usage_window_refreshes_on_age_floor_when_unchanged — even
-# though the value is IDENTICAL to what's on disk, a window whose
-# fetched_at is already older than the refresh floor must still be
-# rewritten (fetched_at advanced to ~now). Without this, a flat usage
+# Same unchanged value, but the cached fetched_at is already past the
+# 300s floor — must be refreshed to ~now. Without this, a flat usage
 # window would freeze fetched_at forever, it would eventually age past
-# resolve_usage_values's 900s read-side staleness bound, and the segment
-# would blank out even though the numbers were never wrong.
+# the 900s read-side bound, and the segment would blank out even though
+# the numbers were never wrong.
 wuc_old_fetched=$(( $(date +%s) - 400 ))
-jq -n --argjson f 9999999999 --argjson fa "$wuc_old_fetched" \
-  '{five_hour:{used_percentage:42,resets_at:$f,fetched_at:$fa}}' > "$WUC_CACHE"
-write_usage_window five_hour 42 9999999999
-wuc_refreshed_fetched=$(jq -r '.five_hour.fetched_at' "$WUC_CACHE" 2>/dev/null)
-[[ "$wuc_refreshed_fetched" != "$wuc_old_fetched" ]] && (( $(date +%s) - wuc_refreshed_fetched < 5 ))
-check "test_write_usage_window_refreshes_on_age_floor_when_unchanged: unchanged value but stale fetched_at still rewritten" $?
-rm -f "$WUC_CACHE"
+IFS=$'\x01' read -r wt2_pct wt2_reset wt2_fetched < <(window_write_triple 1 42 9999999999 42 9999999999 "$wuc_old_fetched")
+[[ "$wt2_fetched" != "$wuc_old_fetched" ]] && (( $(date +%s) - wt2_fetched < 5 ))
+check "test_window_write_triple_refreshes_on_age_floor_when_unchanged: stale-but-unchanged value still refreshed" $?
 
-# A window younger than the refresh floor (10s old, well under it) with
-# an unchanged value must still be left untouched — the floor only forces
-# a write once the window has actually gone stale-ish, not on every call.
-wuc_young_fetched=$(( $(date +%s) - 10 ))
-jq -n --argjson f 9999999999 --argjson fa "$wuc_young_fetched" \
-  '{five_hour:{used_percentage:42,resets_at:$f,fetched_at:$fa}}' > "$WUC_CACHE"
-write_usage_window five_hour 42 9999999999
-wuc_young_after=$(jq -r '.five_hour.fetched_at' "$WUC_CACHE" 2>/dev/null)
-assert_eq "test_write_usage_window_skips_unchanged_within_refresh_floor: 10s-old unchanged window left untouched" "$wuc_young_fetched" "$wuc_young_after"
-rm -f "$WUC_CACHE"
+# A genuinely different value writes through with a fresh fetched_at,
+# regardless of the floor.
+IFS=$'\x01' read -r wt3_pct wt3_reset wt3_fetched < <(window_write_triple 1 55 9999999999 42 9999999999 "$wuc_recent_fetched")
+assert_eq "test_window_write_triple_writes_through_on_change: new value persisted" "55" "$wt3_pct"
+(( $(date +%s) - wt3_fetched < 5 ))
+check "test_window_write_triple_writes_through_on_change: fetched_at refreshed on real change" $?
 
-# A genuinely different value must still write through, and the SIBLING
-# window (not touched by this call) must be carried forward unchanged.
-jq -n --argjson f 9999999999 --argjson fa "$(( $(date +%s) - 10 ))" \
-  '{five_hour:{used_percentage:42,resets_at:$f,fetched_at:$fa},seven_day:{used_percentage:30,resets_at:$f,fetched_at:$fa}}' > "$WUC_CACHE"
-wuc_seven_before=$(jq -r '.seven_day.fetched_at' "$WUC_CACHE" 2>/dev/null)
-sleep 1
-write_usage_window five_hour 55 9999999999
-wuc_fetched_3=$(jq -r '.five_hour.fetched_at' "$WUC_CACHE" 2>/dev/null)
-wuc_five_3=$(jq -r '.five_hour.used_percentage' "$WUC_CACHE" 2>/dev/null)
-wuc_seven_after=$(jq -r '.seven_day.fetched_at' "$WUC_CACHE" 2>/dev/null)
-[[ "$wuc_fetched_3" != "$wuc_seven_before" ]]
-check "test_write_usage_window_writes_through_on_change: fetched_at updates when the value actually changes" $?
-assert_eq "test_write_usage_window_writes_through_on_change: new value persisted" "55" "$wuc_five_3"
-assert_eq "test_write_usage_window_writes_through_on_change: untouched sibling window's fetched_at carried forward unchanged" "$wuc_seven_before" "$wuc_seven_after"
-rm -f "$WUC_CACHE"
+# Not from stdin, cache fresh (within 900s) — carried forward with its
+# OWN original fetched_at untouched. This is the exact property the
+# concurrency fix depends on (see the race test below).
+wuc_fresh_carry=$(( $(date +%s) - 500 ))
+IFS=$'\x01' read -r wt4_pct wt4_reset wt4_fetched < <(window_write_triple 0 "" "" 30 9999999999 "$wuc_fresh_carry")
+assert_eq "test_window_write_triple_carries_forward_fresh_cache: pct carried forward" "30" "$wt4_pct"
+assert_eq "test_window_write_triple_carries_forward_fresh_cache: fetched_at is the ORIGINAL, never re-stamped" "$wuc_fresh_carry" "$wt4_fetched"
 
-# Atomic write: a tmp file + mv, not a direct `> $USAGE_CACHE` redirect
-# (safe today only by luck — a malformed partial write happens to
-# collapse into the anti-fabrication guard — not by design).
-grep -q 'mv ' "$STATUSLINE"
-check "test_write_usage_window_atomic: write_usage_window uses tmp file + mv" $?
-grep -A30 '^write_usage_window() {' "$STATUSLINE" | grep -qE "jq -n.*> \"?\\\$USAGE_CACHE\"?[[:space:]]*2>/dev/null[[:space:]]*$"
-[[ $? -ne 0 ]]; check "test_write_usage_window_atomic: no direct non-atomic redirect into \$USAGE_CACHE" $?
+# Not from stdin, cache stale (past 900s) — dropped (empty triple),
+# never carried forward as a fabricated stale render.
+wuc_stale_carry=$(( $(date +%s) - 950 ))
+IFS=$'\x01' read -r wt5_pct wt5_reset wt5_fetched < <(window_write_triple 0 "" "" 30 9999999999 "$wuc_stale_carry")
+assert_eq "test_window_write_triple_drops_unfresh_cache: pct empty (window omitted), never a fabricated stale value" "" "$wt5_pct"
 
-write_usage_window five_hour 20 9999999999
-[[ -f "$WUC_CACHE" ]]; check "test_write_usage_window_atomic: cache file exists after write" $?
+# write_usage_cache: atomic write, and per-window omission on an empty
+# triple (never a null-valued placeholder).
+grep -q 'mv -f "$tmp" "$USAGE_CACHE"' "$STATUSLINE"
+check "test_write_usage_cache_atomic: write_usage_cache uses tmp file + mv" $?
+grep -q '> "$USAGE_CACHE"' "$STATUSLINE"
+[[ $? -ne 0 ]]; check "test_write_usage_cache_atomic: no direct non-atomic redirect into \$USAGE_CACHE" $?
+
+write_usage_cache 20 9999999999 "$(date +%s)" "" "" ""
+[[ -f "$WUC_CACHE" ]]; check "test_write_usage_cache_atomic: cache file exists after write" $?
 jq -e . "$WUC_CACHE" >/dev/null 2>&1
-check "test_write_usage_window_atomic: cache file is valid, complete JSON (no partial write left behind)" $?
+check "test_write_usage_cache_atomic: cache file is valid, complete JSON (no partial write left behind)" $?
+wuc_seven_omitted=$(jq -r 'has("seven_day")' "$WUC_CACHE" 2>/dev/null)
+assert_eq "test_write_usage_cache_atomic: absent window omitted from the record entirely" "false" "$wuc_seven_omitted"
 wuc_tmp_leftover=$(find "$RUNTIME_DIR" -maxdepth 1 -name '.claude_usage_limits_work.json.tmp*' 2>/dev/null)
 [[ -z "$wuc_tmp_leftover" ]]
-check "test_write_usage_window_atomic: no leftover tmp file after write" $?
+check "test_write_usage_cache_atomic: no leftover tmp file after write" $?
+rm -f "$WUC_CACHE"
+
+# FOLD-3 #2: a jq failure mid-write must not leave the tmp file (or a
+# partial cache file) behind. Stub jq to fail unconditionally for this
+# one call — bash resolves a same-named shell function before $PATH, so
+# this shadows the real binary without touching PATH.
+jq() { return 1; }
+write_usage_cache 20 9999999999 "$(date +%s)" "" "" ""
+unset -f jq
+wuc_tmp_after_failure=$(find "$RUNTIME_DIR" -maxdepth 1 -name '.claude_usage_limits_work.json.tmp*' 2>/dev/null)
+[[ -z "$wuc_tmp_after_failure" ]]
+check "test_write_usage_cache_cleans_tmp_on_jq_failure: no leftover tmp file after a failed write" $?
+[[ ! -f "$WUC_CACHE" ]]
+check "test_write_usage_cache_cleans_tmp_on_jq_failure: no partial cache file left behind either" $?
+
+# persist_usage_windows: the SIBLING window (not itself from stdin) is
+# carried forward with its ORIGINAL fetched_at, in the SAME single write
+# as the changed window.
+puw_seven_fetched=$(( $(date +%s) - 500 ))
+persist_usage_windows 1 55 9999999999 42 9999999999 "$(( $(date +%s) - 10 ))" \
+  0 "" "" 30 9999999999 "$puw_seven_fetched"
+assert_eq "test_persist_usage_windows_single_write: changed window persisted" "55" "$(jq -r '.five_hour.used_percentage' "$WUC_CACHE" 2>/dev/null)"
+assert_eq "test_persist_usage_windows_single_write: untouched sibling carried forward with its ORIGINAL fetched_at (not re-stamped)" "$puw_seven_fetched" "$(jq -r '.seven_day.fetched_at' "$WUC_CACHE" 2>/dev/null)"
+rm -f "$WUC_CACHE"
+
+# A pure cache-read render (neither window from stdin) never touches
+# disk at all — this is what keeps steady-state jq-spawn count down.
+persist_usage_windows 0 "" "" 42 9999999999 "$(date +%s)" 0 "" "" 30 9999999999 "$(date +%s)"
+[[ ! -f "$WUC_CACHE" ]]
+check "test_persist_usage_windows_no_stdin_no_write: pure cache-read render never writes" $?
+
+# An idle session whose stdin keeps reporting the SAME values every
+# render must not rewrite the cache file each time either — both
+# resolved triples are byte-identical to what's already cached, so
+# persist_usage_windows skips the write/jq-spawn entirely (this is what
+# brought steady-state jq spawns back down after removing the old
+# write-time re-read; see the FOLD IN #1 measurement in CHANGELOG/PR notes).
+puw_idle_fetched=$(( $(date +%s) - 10 ))
+jq -n --argjson f 9999999999 --argjson fa "$puw_idle_fetched" \
+  '{five_hour:{used_percentage:42,resets_at:$f,fetched_at:$fa},seven_day:{used_percentage:30,resets_at:$f,fetched_at:$fa}}' > "$WUC_CACHE"
+puw_idle_mtime_before=$(stat -f%m "$WUC_CACHE" 2>/dev/null || stat -c%Y "$WUC_CACHE" 2>/dev/null)
+sleep 1
+persist_usage_windows 1 42 9999999999 42 9999999999 "$puw_idle_fetched" \
+  1 30 9999999999 30 9999999999 "$puw_idle_fetched"
+puw_idle_mtime_after=$(stat -f%m "$WUC_CACHE" 2>/dev/null || stat -c%Y "$WUC_CACHE" 2>/dev/null)
+assert_eq "test_persist_usage_windows_skips_write_when_fully_unchanged: cache file untouched (mtime unchanged) when both windows already match disk" "$puw_idle_mtime_before" "$puw_idle_mtime_after"
+rm -f "$WUC_CACHE"
+
+# ─────────────────────────────────────────────────────────────
+# Area: THE FIX — concurrent last-writer-wins clobber must never re-stamp
+# a stale, lost-update value with a fresh fetched_at.
+#
+# This deterministically reconstructs the actual reported race rather
+# than running two sequential renders (which would NOT pin it — a
+# sequential run never has two writers holding the SAME stale read at
+# once). Both "sessions" below are fed the exact values a real
+# resolve_usage_values would have computed from one shared, already-read
+# cache snapshot, then persist_usage_windows (the real function
+# resolve_usage_values calls) is invoked for each in the racing order:
+#
+#   Session B lands FIRST: seven_day churns to 99 on ITS OWN stdin (a
+#   fresh fetched_at), carrying forward five_hour exactly as it read it.
+#   Session A lands SECOND (last-writer-wins): five_hour churns to 2 on
+#   ITS OWN stdin (fresh), but carries forward seven_day using what IT
+#   read BEFORE B's write landed — never B's 99, and never stamped with
+#   a fresh timestamp merely because A happened to write last.
+#
+# The old write_usage_window re-read the sibling off disk at write time,
+# so A would have spliced in B's fresh seven_day=99 but stamped it with
+# A's OWN fetched_at=now — a stale-in-truth value rendering as verified
+# forever. The fix removes that read entirely: write_usage_cache only
+# ever sees what its caller already decided, so the clobbered value comes
+# back exactly as A read it, honest age and all.
+# ─────────────────────────────────────────────────────────────
+rm -f "$WUC_CACHE"
+RACE_RESET=9999999999
+# 100s old: fresh enough that BOTH sessions' carry-forward reads pass the
+# 900s bound (matching real usage — a live session's cache is typically
+# minutes old, not hours), while still old enough to prove below that its
+# age is honestly preserved (not reset to "now" by the clobber).
+RACE_T0=$(( $(date +%s) - 100 ))
+jq -n --argjson t "$RACE_T0" --argjson r "$RACE_RESET" \
+  '{five_hour:{used_percentage:1,resets_at:$r,fetched_at:$t},seven_day:{used_percentage:1,resets_at:$r,fetched_at:$t}}' > "$WUC_CACHE"
+
+RACE_READ_FIVE_FETCHED="$RACE_T0"
+RACE_READ_SEVEN_FETCHED="$RACE_T0"
+
+persist_usage_windows \
+  0 "" "" 1 "$RACE_RESET" "$RACE_READ_FIVE_FETCHED" \
+  1 99 "$RACE_RESET" 1 "$RACE_RESET" "$RACE_READ_SEVEN_FETCHED"
+
+persist_usage_windows \
+  1 2 "$RACE_RESET" 1 "$RACE_RESET" "$RACE_READ_FIVE_FETCHED" \
+  0 "" "" 1 "$RACE_RESET" "$RACE_READ_SEVEN_FETCHED"
+
+race_seven_pct=$(jq -r '.seven_day.used_percentage' "$WUC_CACHE" 2>/dev/null)
+race_seven_fetched=$(jq -r '.seven_day.fetched_at' "$WUC_CACHE" 2>/dev/null)
+assert_eq "test_concurrent_clobber_never_restamps_stale_value: B's write is an honest lost update (A's stale 1 survives), never a fabricated value" "1" "$race_seven_pct"
+assert_eq "test_concurrent_clobber_never_restamps_stale_value: clobbered seven_day keeps its TRUE original fetched_at, never re-stamped fresh" "$RACE_T0" "$race_seven_fetched"
+# A tight threshold (well under the real ~100s age) proves fetched_at was
+# genuinely preserved, not reset to "now" by the clobbering write — the
+# same relationship that lets the real 900s read bound blank it once its
+# TRUE age crosses that line, instead of rendering forever.
+window_cache_fresh "$race_seven_fetched" 10
+[[ $? -ne 0 ]]
+check "test_concurrent_clobber_never_restamps_stale_value: fetched_at reflects its true ~100s age, not a fresh re-stamp — proves the honest-aging property the 900s bound relies on" $?
+race_five_pct=$(jq -r '.five_hour.used_percentage' "$WUC_CACHE" 2>/dev/null)
+assert_eq "test_concurrent_clobber_never_restamps_stale_value: the winning session's OWN write (five_hour) still lands correctly" "2" "$race_five_pct"
 rm -f "$WUC_CACHE"
 
 # test_stdin_unchanged_values_refresh_fetched_at_end_to_end — proves the

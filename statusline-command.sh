@@ -130,67 +130,102 @@ readonly USAGE_CACHE="${RUNTIME_DIR}/.claude_usage_limits_${ACCOUNT_ID}.json"
 # cache written before the per-window fetched_at split (single file-global
 # fetched_at, none nested per window) has no [window].fetched_at at all —
 # reads back empty here, so the caller's freshness check always treats it
-# as UNFRESH. Never migrated forward; see write_usage_window.
+# as UNFRESH. Never migrated forward — the next write replaces the whole
+# file with the current per-window schema (see write_usage_cache).
 read_cached_window() {
   local window=$1
   [[ -f "$USAGE_CACHE" ]] || return
   jq -r --arg w "$window" '[(.[$w].used_percentage // ""), (.[$w].resets_at // ""), (.[$w].fetched_at // "")] | map(tostring) | join("\u0001")' "$USAGE_CACHE" 2>/dev/null
 }
 
-# A fetched_at is fresh within this many seconds — shared by the read-side
-# 900s bound (here) and the write-side 300s floor (write_usage_window),
-# evaluated per window so a live sibling's churn can never prop up a
-# stale window's freshness (the file-global fetched_at gap fixed here).
+# A fetched_at is fresh within THRESHOLD seconds — default 900 (the
+# read-side bound); write_usage_cache's caller passes 300 (the persist
+# floor) so both bounds share this one age<=threshold comparison instead
+# of being two independently-derived checks with different operators.
 window_cache_fresh() {
-  local fetched_at=$1
+  local fetched_at=$1 threshold=${2:-900}
   [[ -z "$fetched_at" || "$fetched_at" == "null" || ! "$fetched_at" =~ ^[0-9]+$ ]] && return 1
-  (( $(date +%s) - fetched_at <= 900 ))
+  (( $(date +%s) - fetched_at <= threshold ))
 }
 
-# Writes ONE window's cache entry, stamping ITS OWN fetched_at — the
-# sibling window's entry is carried forward from disk untouched (a
-# legacy/malformed sibling just stays legacy/malformed, never migrated).
-write_usage_window() {
-  [[ "$RUNTIME_DIR_SAFE" != "1" ]] && return
-  # Never persist a GUESSED identity's numbers — same refusal the
-  # deleted refresh_token_grant made on ACCOUNT_ASSUMED. An env-less
-  # session that guesses "work" and writes its own usage into the work
-  # cache file poisons a later, genuinely-detected work session, which
-  # would then render the guess as its own numbers, undimmed. Rendering
-  # from stdin this run is unaffected — only the write is gated.
-  ((ACCOUNT_ASSUMED)) && return
-  local window=$1 pct=$2 reset=$3
+# Decides ONE window's write_usage_cache triple. A value fetched THIS
+# render is stamped with `now`; a value only carried forward from cache
+# keeps its ORIGINAL fetched_at — never re-stamped. That is what turns a
+# concurrent last-writer-wins clobber into an honest lost update (the
+# 900s read bound can still age the loser out) instead of a stale value
+# wearing a fresh timestamp forever. An unchanged value already inside
+# the 300s floor is also carried forward rather than re-stamped, so a
+# churning sibling can't force a disk write every render. Absent/unfresh/
+# invalid resolves to an empty triple, which write_usage_cache omits from
+# the record. Prints "pct\x01reset\x01fetched_at" (empty fields when
+# omitted).
+window_write_triple() {
+  local from_stdin=$1 pct=$2 reset=$3
+  local cache_pct=$4 cache_reset=$5 cache_fetched_at=$6
 
-  # Skip only when this window's own value is unchanged from disk AND its
-  # own fetched_at is still younger than this floor — same throttle
-  # rationale as before, now scoped to one window so it can't be tripped
-  # (or bypassed) by the sibling's activity.
-  local existing_pct existing_reset existing_fetched_at refresh_floor=300
-  IFS=$'\x01' read -r existing_pct existing_reset existing_fetched_at < <(read_cached_window "$window")
-  if [[ "$existing_pct" == "$pct" && "$existing_reset" == "$reset" \
-    && "$existing_fetched_at" =~ ^[0-9]+$ ]] \
-    && (( $(date +%s) - existing_fetched_at < refresh_floor )); then
+  if ((from_stdin)); then
+    if [[ "$pct" == "$cache_pct" && "$reset" == "$cache_reset" ]] \
+      && window_cache_fresh "$cache_fetched_at" 300; then
+      printf '%s\x01%s\x01%s' "$cache_pct" "$cache_reset" "$cache_fetched_at"
+      return
+    fi
+    printf '%s\x01%s\x01%s' "$pct" "$reset" "$(date +%s)"
     return
   fi
 
-  local sibling="seven_day"
-  [[ "$window" == "seven_day" ]] && sibling="five_hour"
-  local sibling_json="null"
-  [[ -f "$USAGE_CACHE" ]] && sibling_json=$(jq -c --arg s "$sibling" '.[$s] // null' "$USAGE_CACHE" 2>/dev/null)
-  [[ -z "$sibling_json" ]] && sibling_json="null"
+  if [[ -n "$cache_pct" ]] && window_cache_fresh "$cache_fetched_at" 900; then
+    printf '%s\x01%s\x01%s' "$cache_pct" "$cache_reset" "$cache_fetched_at"
+    return
+  fi
+  printf '\x01\x01'
+}
 
-  # Atomic write: tmp file + mv, not a direct redirect into $USAGE_CACHE
-  # — a reader mid-write must never see a partial/truncated cache
-  # (safe today only by luck, since a malformed partial write happens to
-  # collapse into the anti-fabrication guard — not by design).
+# The ONLY place the usage cache is written: one disk write, from
+# caller-held values, never a read of the sibling. Removing that read is
+# what removes the race — the prior write here spliced the sibling off
+# disk before every mv, so two concurrent sessions could interleave
+# read/write and re-stamp a stale sibling with a fresh fetched_at (see
+# window_write_triple for how each fetched_at is decided before it ever
+# reaches here). A null pct omits that window from the record entirely.
+write_usage_cache() {
+  [[ "$RUNTIME_DIR_SAFE" != "1" ]] && return
+  # Never persist a GUESSED identity's numbers — see detect_account.
+  ((ACCOUNT_ASSUMED)) && return
+  local five_pct=$1 five_reset=$2 five_fetched_at=$3
+  local seven_pct=$4 seven_reset=$5 seven_fetched_at=$6
+
   local tmp="${USAGE_CACHE}.tmp.$$"
   jq -n \
-    --arg window "$window" --arg sibling "$sibling" \
-    --argjson sibling_val "$sibling_json" \
-    --argjson pct "${pct:-null}" --argjson reset "${reset:-null}" \
-    --argjson fetched_at "$(date +%s)" \
-    '{($window): {used_percentage: $pct, resets_at: $reset, fetched_at: $fetched_at}, ($sibling): $sibling_val}' \
-    > "$tmp" 2>/dev/null && mv -f "$tmp" "$USAGE_CACHE"
+    --argjson fp "${five_pct:-null}" --argjson fr "${five_reset:-null}" --argjson ffa "${five_fetched_at:-null}" \
+    --argjson sp "${seven_pct:-null}" --argjson sr "${seven_reset:-null}" --argjson sfa "${seven_fetched_at:-null}" \
+    '(if $fp != null then {five_hour: {used_percentage: $fp, resets_at: $fr, fetched_at: $ffa}} else {} end)
+     + (if $sp != null then {seven_day: {used_percentage: $sp, resets_at: $sr, fetched_at: $sfa}} else {} end)' \
+    > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$USAGE_CACHE"
+}
+
+# Persists this render's two windows in ONE write, only when stdin
+# actually carried something — a pure cache-read render (no rate_limits
+# on stdin at all) never touches disk.
+persist_usage_windows() {
+  local five_from_stdin=$1 five_pct=$2 five_reset=$3
+  local cache_five_pct=$4 cache_five_reset=$5 cache_five_fetched_at=$6
+  local seven_from_stdin=$7 seven_pct=$8 seven_reset=$9
+  local cache_seven_pct=${10} cache_seven_reset=${11} cache_seven_fetched_at=${12}
+  ((five_from_stdin || seven_from_stdin)) || return
+
+  local w5_pct w5_reset w5_fetched_at w7_pct w7_reset w7_fetched_at
+  IFS=$'\x01' read -r w5_pct w5_reset w5_fetched_at < <(window_write_triple "$five_from_stdin" "$five_pct" "$five_reset" "$cache_five_pct" "$cache_five_reset" "$cache_five_fetched_at")
+  IFS=$'\x01' read -r w7_pct w7_reset w7_fetched_at < <(window_write_triple "$seven_from_stdin" "$seven_pct" "$seven_reset" "$cache_seven_pct" "$cache_seven_reset" "$cache_seven_fetched_at")
+
+  # Both triples resolved to exactly what's already on disk (a churning
+  # window that happens to report the same value this render still counts
+  # as "unchanged" here) — skip the write/jq-spawn entirely rather than
+  # rewrite an identical file on every render of an idle session.
+  [[ "$w5_pct" == "$cache_five_pct" && "$w5_reset" == "$cache_five_reset" && "$w5_fetched_at" == "$cache_five_fetched_at" \
+    && "$w7_pct" == "$cache_seven_pct" && "$w7_reset" == "$cache_seven_reset" && "$w7_fetched_at" == "$cache_seven_fetched_at" ]] && return
+
+  write_usage_cache "$w5_pct" "$w5_reset" "$w5_fetched_at" "$w7_pct" "$w7_reset" "$w7_fetched_at"
 }
 
 # Renders one window's "label:pct%" segment. reset_epoch drives the
@@ -227,45 +262,47 @@ resolve_window() {
 }
 
 # Resolves this render's usage values: stdin when present, falling back
-# per window to the (900s-fresh) cache otherwise, refreshing the cache
-# whenever stdin carried anything. Validates used_percentage before it's
-# used further — invalid is treated as ABSENT, never fabricated as 0.
+# per window to the (900s-fresh) cache otherwise, persisting the result
+# in ONE write via persist_usage_windows when stdin carried anything.
+# Validates used_percentage before it's used further — invalid is
+# treated as ABSENT, never fabricated as 0.
 # Prints "five_pct\x01five_reset\x01seven_pct\x01seven_reset".
 resolve_usage_values() {
   # A cache under a RUNTIME_DIR we don't own could be attacker-planted —
   # render no usage segment rather than trust its contents this run.
   [[ "$RUNTIME_DIR_SAFE" != "1" ]] && return
 
-  # \x01 (not @tsv's tab) throughout this file's IFS=... read lines, on
-  # purpose: bash's `read` classifies tab as "IFS whitespace" no matter
-  # what IFS is set to, so it squashes/strips LEADING and consecutive
-  # tabs — silently misaligning every field whenever an early field is
-  # empty. Routine now that either usage window (or the PR fields) can
-  # be legitimately absent. \x01 isn't whitespace, so empty leading/
-  # middle fields still read into the right variable.
+  # \x01 (not @tsv's tab) throughout this file's IFS=... read lines — see
+  # read_cached_window's docstring for why.
   local stdin_five_pct stdin_five_reset stdin_seven_pct stdin_seven_reset
   IFS=$'\x01' read -r stdin_five_pct stdin_five_reset stdin_seven_pct stdin_seven_reset < <(
-    printf '%s' "$INPUT" | jq -r '[(.rate_limits.five_hour.used_percentage // ""), (.rate_limits.five_hour.resets_at // ""), (.rate_limits.seven_day.used_percentage // ""), (.rate_limits.seven_day.resets_at // "")] | map(tostring) | join("")' 2>/dev/null
+    printf '%s' "$INPUT" | jq -r '[(.rate_limits.five_hour.used_percentage // ""), (.rate_limits.five_hour.resets_at // ""), (.rate_limits.seven_day.used_percentage // ""), (.rate_limits.seven_day.resets_at // "")] | map(tostring) | join("\u0001")' 2>/dev/null
   )
 
-  # Cache read, per window — each window's OWN fetched_at gates its own
-  # freshness (900s), so a live window's churn can never prop up a stale
-  # sibling's. A cache written before the per-window split (or an old
-  # v0.6.x cache with different field names entirely) has no nested
-  # fetched_at and reads back empty here — never a fabricated 0%.
+  # The ONLY cache read this render makes — read_cached_window's
+  # docstring explains the legacy-schema-reads-back-empty behavior.
+  # persist_usage_windows below writes purely from these in-memory
+  # values, never re-reading, so there is no read-modify-write gap left
+  # for a concurrent second writer to race.
   local cache_five_pct="" cache_five_reset="" cache_five_fetched_at=""
   IFS=$'\x01' read -r cache_five_pct cache_five_reset cache_five_fetched_at < <(read_cached_window five_hour)
-  window_cache_fresh "$cache_five_fetched_at" || { cache_five_pct=""; cache_five_reset=""; }
-
   local cache_seven_pct="" cache_seven_reset="" cache_seven_fetched_at=""
   IFS=$'\x01' read -r cache_seven_pct cache_seven_reset cache_seven_fetched_at < <(read_cached_window seven_day)
-  window_cache_fresh "$cache_seven_fetched_at" || { cache_seven_pct=""; cache_seven_reset=""; }
+
+  # Freshness-filtered copies feed rendering/resolve_window; the RAW
+  # cache_*_pct/reset/fetched_at above stay unfiltered for
+  # persist_usage_windows, which needs the true on-disk age regardless
+  # of whether it is still render-fresh.
+  local render_five_pct="$cache_five_pct" render_five_reset="$cache_five_reset"
+  window_cache_fresh "$cache_five_fetched_at" || { render_five_pct=""; render_five_reset=""; }
+  local render_seven_pct="$cache_seven_pct" render_seven_reset="$cache_seven_reset"
+  window_cache_fresh "$cache_seven_fetched_at" || { render_seven_pct=""; render_seven_reset=""; }
 
   # Per-window resolution (the C2 fix): a payload carrying only one
   # window must never blank out the other's still-good cached data.
   local five_pct five_reset five_from_stdin seven_pct seven_reset seven_from_stdin
-  IFS=$'\x01' read -r five_pct five_reset five_from_stdin < <(resolve_window "$stdin_five_pct" "$stdin_five_reset" "$cache_five_pct" "$cache_five_reset")
-  IFS=$'\x01' read -r seven_pct seven_reset seven_from_stdin < <(resolve_window "$stdin_seven_pct" "$stdin_seven_reset" "$cache_seven_pct" "$cache_seven_reset")
+  IFS=$'\x01' read -r five_pct five_reset five_from_stdin < <(resolve_window "$stdin_five_pct" "$stdin_five_reset" "$render_five_pct" "$render_five_reset")
+  IFS=$'\x01' read -r seven_pct seven_reset seven_from_stdin < <(resolve_window "$stdin_seven_pct" "$stdin_seven_reset" "$render_seven_pct" "$render_seven_reset")
 
   # Validate before this reaches awk/bash arithmetic — invalid is
   # ABSENT, never fabricated as 0. Runs before the cache write so a bad
@@ -273,12 +310,11 @@ resolve_usage_values() {
   [[ "$five_pct" =~ ^[0-9]+(\.[0-9]+)?$ ]] || five_pct=""
   [[ "$seven_pct" =~ ^[0-9]+(\.[0-9]+)?$ ]] || seven_pct=""
 
-  # Each window is written (and stamped) only when IT actually came from
-  # stdin this render — never as a side effect of the sibling's write.
-  ((five_from_stdin)) && write_usage_window five_hour "$five_pct" "$five_reset"
-  ((seven_from_stdin)) && write_usage_window seven_day "$seven_pct" "$seven_reset"
+  persist_usage_windows \
+    "$five_from_stdin" "$five_pct" "$five_reset" "$cache_five_pct" "$cache_five_reset" "$cache_five_fetched_at" \
+    "$seven_from_stdin" "$seven_pct" "$seven_reset" "$cache_seven_pct" "$cache_seven_reset" "$cache_seven_fetched_at"
 
-  printf '%s%s%s%s' "$five_pct" "$five_reset" "$seven_pct" "$seven_reset"
+  printf '%s\x01%s\x01%s\x01%s' "$five_pct" "$five_reset" "$seven_pct" "$seven_reset"
 }
 
 get_usage_limits() {
