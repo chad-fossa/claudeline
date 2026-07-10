@@ -142,6 +142,8 @@ claudeline can't fully close the shared-keychain-slot issue above on its own, bu
 
 A capture that gets vetoed (identity mismatch, or login/Keychain timing outside the corroboration window) never writes a file — it drops `/tmp/claudeline-<uid>/.claude_cred_capture_vetoed_<account>` instead, and `?` stays exactly as before the login attempt.
 
+Provenance's staleness edge (above) also runs in reverse: if `.credentials.json` gets swapped out for a different, mismatched identity right after a `verified_match` was already cached, `?` can incorrectly stay *suppressed* for up to that same 300s — it self-corrects at the next cache write (session start / `/usage` / background refresh), same as the forward case.
+
 ### Customizing account labels
 
 Set env vars in `.zshrc`:
