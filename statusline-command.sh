@@ -421,6 +421,17 @@ get_pr_number() {
   # rather than trust or write to a RUNTIME_DIR we don't own.
   [[ "$RUNTIME_DIR_SAFE" != "1" ]] && return
   local repo_name=$1 branch=$2
+
+  # Never persist under a guessed identity — see write_usage_cache for
+  # why. Still resolve live via gh so rendering is unaffected; only the
+  # cache/branch-cache/lock writes are skipped.
+  if ((ACCOUNT_ASSUMED)); then
+    local pr_num
+    pr_num=$(timeout 2 gh pr view --json number -q '.number' 2>/dev/null || true)
+    [[ -n "$pr_num" ]] && echo "#$pr_num"
+    return
+  fi
+
   local cache="${RUNTIME_DIR}/.claude_pr_cache_${repo_name}_${ACCOUNT_ID}"
   local branch_cache="${RUNTIME_DIR}/.claude_pr_branch_${repo_name}_${ACCOUNT_ID}"
 

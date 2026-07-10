@@ -586,6 +586,61 @@ rm -f ${RUNTIME_DIR}/.claude_pr_cache_${prstdin_repo}_* ${RUNTIME_DIR}/.claude_p
 rm -rf "$GHSTUB2" "$PRSTDIN_DIR"
 
 # ─────────────────────────────────────────────────────────────
+# Area: PR-cache never persists under a guessed identity. Mirrors the
+# write_usage_cache guard above — get_pr_number had no ACCOUNT_ASSUMED
+# guard on its cache/branch-cache/lock writes.
+# ─────────────────────────────────────────────────────────────
+PRASSUMED_DIR=$(mktemp -d)
+git -C "$PRASSUMED_DIR" init -q
+git -C "$PRASSUMED_DIR" commit -q --allow-empty -m init
+
+GHSTUB3=$(mktemp -d)
+GH_CALLED3="$GHSTUB3/gh_called"
+cat > "$GHSTUB3/gh" <<EOF
+#!/bin/bash
+touch "$GH_CALLED3"
+echo '777'
+EOF
+chmod +x "$GHSTUB3/gh"
+
+prassumed_repo=$(basename "$PRASSUMED_DIR")
+rm -f ${RUNTIME_DIR}/.claude_pr_cache_${prassumed_repo}_* ${RUNTIME_DIR}/.claude_pr_branch_${prassumed_repo}_* ${RUNTIME_DIR}/.claude_pr_lock_${prassumed_repo}_*
+
+# test_assumed_identity_pr_cache_never_written
+nopr_json=$(jq -n --arg dir "$PRASSUMED_DIR" '{workspace:{current_dir:$dir},context_window:{used_percentage:5}}')
+rm -f "$GH_CALLED3"
+prassumed_out=$(printf '%s' "$nopr_json" | PATH="$GHSTUB3:$PATH" env -u CLAUDE_CONFIG_DIR bash "$STATUSLINE" 2>/dev/null)
+[[ ! -f ${RUNTIME_DIR}/.claude_pr_cache_${prassumed_repo}_work ]]
+check "test_assumed_identity_pr_cache_never_written: no PR cache file written on a guessed identity" $?
+[[ ! -f ${RUNTIME_DIR}/.claude_pr_branch_${prassumed_repo}_work ]]
+check "test_assumed_identity_pr_cache_never_written: no PR branch-cache file written on a guessed identity" $?
+echo "$prassumed_out" | grep -q '#777'
+check "test_assumed_identity_pr_cache_never_written: render still shows the PR from a live gh call" $?
+
+# test_explicit_identity_pr_cache_still_written — regression guard: an
+# explicit (non-guessed) identity keeps writing the cache as before.
+rm -f ${RUNTIME_DIR}/.claude_pr_cache_${prassumed_repo}_* ${RUNTIME_DIR}/.claude_pr_branch_${prassumed_repo}_* ${RUNTIME_DIR}/.claude_pr_lock_${prassumed_repo}_*
+prexplicit_out=$(printf '%s' "$nopr_json" | PATH="$GHSTUB3:$PATH" CLAUDE_CONFIG_DIR="$HOME/.claude" bash "$STATUSLINE" 2>/dev/null)
+[[ -f ${RUNTIME_DIR}/.claude_pr_cache_${prassumed_repo}_work ]]
+check "test_explicit_identity_pr_cache_still_written: PR cache file written on an explicit identity" $?
+echo "$prexplicit_out" | grep -q '#777'
+check "test_explicit_identity_pr_cache_still_written: render shows the PR" $?
+
+# test_assumed_identity_stdin_pr_no_cache_no_gh — stdin-carried PR under
+# a guessed identity: renders from stdin, gh never spawned, no cache write.
+rm -f ${RUNTIME_DIR}/.claude_pr_cache_${prassumed_repo}_* ${RUNTIME_DIR}/.claude_pr_branch_${prassumed_repo}_* "$GH_CALLED3"
+stdinpr_assumed_json=$(jq -n --arg dir "$PRASSUMED_DIR" '{workspace:{current_dir:$dir},context_window:{used_percentage:5},pr:{number:42,url:"https://github.com/x/y/pull/42"}}')
+prstdinassumed_out=$(printf '%s' "$stdinpr_assumed_json" | PATH="$GHSTUB3:$PATH" env -u CLAUDE_CONFIG_DIR bash "$STATUSLINE" 2>/dev/null)
+echo "$prstdinassumed_out" | grep -q '#42'
+check "test_assumed_identity_stdin_pr_no_cache_no_gh: stdin PR rendered under a guessed identity" $?
+[[ ! -f "$GH_CALLED3" ]]; check "test_assumed_identity_stdin_pr_no_cache_no_gh: gh NOT invoked" $?
+[[ ! -f ${RUNTIME_DIR}/.claude_pr_cache_${prassumed_repo}_work ]]
+check "test_assumed_identity_stdin_pr_no_cache_no_gh: no PR cache file written" $?
+
+rm -f ${RUNTIME_DIR}/.claude_pr_cache_${prassumed_repo}_* ${RUNTIME_DIR}/.claude_pr_branch_${prassumed_repo}_* ${RUNTIME_DIR}/.claude_pr_lock_${prassumed_repo}_* "$GH_CALLED3"
+rm -rf "$GHSTUB3" "$PRASSUMED_DIR"
+
+# ─────────────────────────────────────────────────────────────
 # Area: no dead refresh/marker machinery left in statusline-command.sh
 # (grep-verify — the full-tree variant that also covers install.sh and
 # the deleted hook/capture files lives at the end of this suite).
