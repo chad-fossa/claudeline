@@ -546,6 +546,31 @@ assert_eq "test_get_branch_strips_esc: branch name ESC stripped" "0" "$d2_branch
 echo "$d2_branch_out" | grep -q "evilPWNED"
 check "test_get_branch_strips_esc: sanitized text still present" $?
 
+# FIX2: the non-git-repo render path's `folder` (basename of stdin's
+# workspace.current_dir) was the one strip_ctrl call site missed — a real
+# directory (not a stub) since a malicious workspace.current_dir is the
+# actual attacker-controlled vector, not something git would need to
+# accept as a ref name. ESC count is compared against a same-shape clean
+# render (not hardcoded) since acct_prefix/progress_bar's own SGR bytes
+# vary with surrounding state.
+FIX2_PARENT=$(mktemp -d)
+FIX2_EVIL_DIR="$FIX2_PARENT/evil"$'\033'"PWNED"
+mkdir -p "$FIX2_EVIL_DIR"
+fix2_json=$(jq -n --arg dir "$FIX2_EVIL_DIR" '{workspace:{current_dir:$dir},context_window:{used_percentage:5}}')
+fix2_out=$(printf '%s' "$fix2_json" | CLAUDE_CONFIG_DIR="$HOME/.claude" bash "$STATUSLINE" 2>/dev/null)
+fix2_esc_count=$(printf '%s' "$fix2_out" | tr -cd '\033' | wc -c | tr -d ' ')
+
+FIX2_CLEAN_DIR="$FIX2_PARENT/evilPWNED"
+mkdir -p "$FIX2_CLEAN_DIR"
+fix2_clean_json=$(jq -n --arg dir "$FIX2_CLEAN_DIR" '{workspace:{current_dir:$dir},context_window:{used_percentage:5}}')
+fix2_clean_out=$(printf '%s' "$fix2_clean_json" | CLAUDE_CONFIG_DIR="$HOME/.claude" bash "$STATUSLINE" 2>/dev/null)
+fix2_clean_esc_count=$(printf '%s' "$fix2_clean_out" | tr -cd '\033' | wc -c | tr -d ' ')
+
+assert_eq "test_folder_strips_esc: ESC count matches a clean-name render (no leaked ESC)" "$fix2_clean_esc_count" "$fix2_esc_count"
+echo "$fix2_out" | grep -q "evilPWNED"
+check "test_folder_strips_esc: sanitized folder text still present" $?
+rm -rf "$FIX2_PARENT"
+
 # ─────────────────────────────────────────────────────────────
 # Area: D3 — RUNTIME_DIR must also be refused when it's group/other
 # writable. mkdir -m 700 only applies at CREATE time; an existing dir

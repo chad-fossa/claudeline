@@ -645,7 +645,7 @@ build_output() {
   else
     # Not in git - full format
     local folder
-    folder=$(basename "$CWD")
+    folder=$(strip_ctrl "$(basename "$CWD")")
 
     printf '%s%s %d%% ' "$acct_prefix" "$(progress_bar "$percent")" "$percent"
     local usage_str
