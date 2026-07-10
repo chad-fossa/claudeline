@@ -317,6 +317,127 @@ echo "$FETCH_USAGE_SRC" | grep -q -- '--max-time 5'
 check "fetch_usage uses --max-time 5" $?
 
 # ─────────────────────────────────────────────────────────────
+# Area: maybe_auto_capture (Task 8 — "/login is all I do"). Trigger is a
+# value-delta on .oauthAccount.profileFetchedAt (never mtime — see
+# multi-profile-isolation review), gated by a TWO-SIDED corroboration
+# window against the keychain item's mdat (a one-sided window is
+# satisfiable by a second profile's concurrent login — the review's
+# critical finding).
+# ─────────────────────────────────────────────────────────────
+MAC_SRC=$(extract_func "$HOOK" maybe_auto_capture)
+RKM_SRC=$(extract_func "$HOOK" read_keychain_mdat_epoch)
+RCS_SRC=$(extract_func "$HOOK" resolve_capture_script)
+[[ -n "$MAC_SRC" ]]; check "maybe_auto_capture is defined" $?
+eval "$RKM_SRC"
+eval "$RCS_SRC"
+eval "$MAC_SRC"
+
+epoch_to_mdat_ts() {
+  local epoch=$1
+  if [[ "$(uname)" == "Darwin" ]]; then
+    TZ=UTC date -j -f "%s" "$epoch" "+%Y%m%d%H%M%SZ" 2>/dev/null
+  else
+    date -u -d "@$epoch" "+%Y%m%d%H%M%SZ" 2>/dev/null
+  fi
+}
+
+AUTOSEC=$(mktemp -d)
+cat > "$AUTOSEC/security" <<'EOF'
+#!/bin/bash
+for arg in "$@"; do
+  [[ "$arg" == "-w" ]] && { echo '{"claudeAiOauth":{"accessToken":"tok_fake_should_not_be_read"}}'; exit 0; }
+done
+cat <<MDATEOF
+keychain: "/tmp/fake.keychain-db"
+version: 512
+class: "genp"
+attributes:
+    0x00000007 <blob>="Claude Code-credentials"
+    "acct"<blob>="fakeacct"
+    "cdat"<timestamp>="${MDAT_TS}"
+    "mdat"<timestamp>="${MDAT_TS}"
+MDATEOF
+EOF
+chmod +x "$AUTOSEC/security"
+export PATH="$AUTOSEC:$PATH"
+
+AC_DIR=$(mktemp -d)
+_CREDS_DIR="$AC_DIR"
+mkdir -p "$_CREDS_DIR/scripts"
+ACCOUNT_ID="clltest"
+ACCOUNT_ASSUMED=0
+OSTYPE="darwin24"
+BASE_EPOCH=$(date +%s)
+BASE_MS=$((BASE_EPOCH * 1000))
+
+# capture-profile-session.sh stub: sentinel file records invocation
+cat > "$_CREDS_DIR/scripts/capture-profile-session.sh" <<'EOF'
+#!/bin/bash
+touch "$AUTO_CAPTURE_SENTINEL"
+EOF
+chmod +x "$_CREDS_DIR/scripts/capture-profile-session.sh"
+AUTO_CAPTURE_SENTINEL="$AC_DIR/capture_invoked"
+export AUTO_CAPTURE_SENTINEL
+
+rmdir "/tmp/.claude_cred_lock_clltest" 2>/dev/null
+rm -f "/tmp/.claude_cred_capture_vetoed_clltest"
+
+# Trigger fires: profileFetchedAt differs from captured_login_at, mdat +5s
+# (inside default 30s window) -> capture invoked.
+echo "{\"oauthAccount\":{\"accountUuid\":\"acct-1\",\"profileFetchedAt\":$BASE_MS}}" > "$_CREDS_DIR/.claude.json"
+rm -f "$_CREDS_DIR/.credentials.json"
+export MDAT_TS=$(epoch_to_mdat_ts $((BASE_EPOCH + 5)))
+rm -f "$AUTO_CAPTURE_SENTINEL"
+maybe_auto_capture
+[[ -f "$AUTO_CAPTURE_SENTINEL" ]]; check "trigger + mdat+5s (in window): capture invoked" $?
+
+# mdat 90s AFTER stamp -> veto artifact, no capture
+export MDAT_TS=$(epoch_to_mdat_ts $((BASE_EPOCH + 90)))
+rm -f "$AUTO_CAPTURE_SENTINEL" "/tmp/.claude_cred_capture_vetoed_clltest"
+maybe_auto_capture
+[[ ! -f "$AUTO_CAPTURE_SENTINEL" ]]; check "mdat +90s (outside window): capture NOT invoked" $?
+[[ -f "/tmp/.claude_cred_capture_vetoed_clltest" ]]; check "mdat +90s (outside window): veto artifact created" $?
+
+# mdat 40s BEFORE stamp -> veto too (two-sidedness — the review's fix for
+# the one-sided-window defect)
+export MDAT_TS=$(epoch_to_mdat_ts $((BASE_EPOCH - 40)))
+rm -f "$AUTO_CAPTURE_SENTINEL" "/tmp/.claude_cred_capture_vetoed_clltest"
+maybe_auto_capture
+[[ ! -f "$AUTO_CAPTURE_SENTINEL" ]]; check "mdat -40s (outside window, two-sided): capture NOT invoked" $?
+[[ -f "/tmp/.claude_cred_capture_vetoed_clltest" ]]; check "mdat -40s (outside window, two-sided): veto artifact created" $?
+
+# profileFetchedAt absent -> no auto-capture (unchanged keychain+? behavior)
+echo '{"oauthAccount":{"accountUuid":"acct-1"}}' > "$_CREDS_DIR/.claude.json"
+export MDAT_TS=$(epoch_to_mdat_ts $((BASE_EPOCH + 5)))
+rm -f "$AUTO_CAPTURE_SENTINEL" "/tmp/.claude_cred_capture_vetoed_clltest"
+maybe_auto_capture
+[[ ! -f "$AUTO_CAPTURE_SENTINEL" ]]; check "profileFetchedAt absent: capture NOT invoked" $?
+[[ ! -f "/tmp/.claude_cred_capture_vetoed_clltest" ]]; check "profileFetchedAt absent: no veto artifact (not a veto, just no trigger)" $?
+
+# ACCOUNT_ASSUMED=1 -> refuse outright
+echo "{\"oauthAccount\":{\"accountUuid\":\"acct-1\",\"profileFetchedAt\":$BASE_MS}}" > "$_CREDS_DIR/.claude.json"
+ACCOUNT_ASSUMED=1
+rm -f "$_CREDS_DIR/.credentials.json" "$AUTO_CAPTURE_SENTINEL"
+maybe_auto_capture
+[[ ! -f "$AUTO_CAPTURE_SENTINEL" ]]; check "ACCOUNT_ASSUMED=1: capture NOT invoked" $?
+ACCOUNT_ASSUMED=0
+
+# capture script missing -> loud skip, never fatal (render must proceed)
+rm -f "$_CREDS_DIR/scripts/capture-profile-session.sh"
+rm -f "$_CREDS_DIR/.credentials.json" "$AUTO_CAPTURE_SENTINEL"
+maybe_auto_capture 2>/tmp/.cll_ac_stderr
+result=$?
+assert_eq "capture script missing: maybe_auto_capture still returns 0 (non-fatal)" "0" "$result"
+[[ -s /tmp/.cll_ac_stderr ]]; check "capture script missing: loud stderr" $?
+rm -f /tmp/.cll_ac_stderr
+
+unset AUTO_CAPTURE_SENTINEL MDAT_TS
+rm -rf "$AC_DIR" "$AUTOSEC"
+rm -f "/tmp/.claude_cred_capture_vetoed_clltest"
+rmdir "/tmp/.claude_cred_lock_clltest" 2>/dev/null
+unset _CREDS_DIR ACCOUNT_ID ACCOUNT_ASSUMED
+
+# ─────────────────────────────────────────────────────────────
 # Area: main() file-refresh-failed handling (artifact + cache merge,
 # no silent keychain fallback)
 # ─────────────────────────────────────────────────────────────
