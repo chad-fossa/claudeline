@@ -321,6 +321,57 @@ check "test_fresh_cache_within_max_age_renders: 1-minute-old cache still renders
 rm -f "$GUL_CACHE"
 
 # ─────────────────────────────────────────────────────────────
+# Area: C2 — per-window stdin gating. get_usage_limits previously gated
+# the ENTIRE stdin branch on five_hour alone: a payload carrying only
+# seven_day (five_hour genuinely absent from that response) rendered
+# NOTHING and cached NOTHING — real data silently dropped. Each window
+# must be gated independently. Both directions tested since a prior
+# review round claimed five-only worked but seven-only broke.
+# ─────────────────────────────────────────────────────────────
+
+# test_stdin_five_only_renders_and_caches_five_omits_seven
+rm -f "$GUL_CACHE"
+GUL_B_FIVE=$(( $(date +%s) + 3600 ))
+stdin_five_only_json=$(jq -n --argjson f "$GUL_B_FIVE" '{
+  workspace: {current_dir: "/tmp"},
+  context_window: {used_percentage: 5},
+  rate_limits: {
+    five_hour: {used_percentage: 61, resets_at: $f}
+  }
+}')
+gul_five_only_out=$(printf '%s' "$stdin_five_only_json" | CLAUDE_CONFIG_DIR="$HOME/.claude" bash "$STATUSLINE" 2>/dev/null)
+echo "$gul_five_only_out" | grep -q '61%'
+check "test_stdin_five_only_renders_and_caches_five_omits_seven: 5h window renders" $?
+gul_five_only_pct_count=$(echo "$gul_five_only_out" | grep -o '%' | wc -l | tr -d ' ')
+assert_eq "test_stdin_five_only_renders_and_caches_five_omits_seven: only context% + 5h% rendered (7d omitted)" "2" "$gul_five_only_pct_count"
+assert_eq "test_stdin_five_only_renders_and_caches_five_omits_seven: 5h cached" "61" "$(jq -r '.five_hour.used_percentage' "$GUL_CACHE" 2>/dev/null)"
+gul_five_only_cached_seven=$(jq -r '.seven_day.used_percentage' "$GUL_CACHE" 2>/dev/null)
+[[ -z "$gul_five_only_cached_seven" || "$gul_five_only_cached_seven" == "null" ]]
+check "test_stdin_five_only_renders_and_caches_five_omits_seven: 7d not fabricated in cache" $?
+rm -f "$GUL_CACHE"
+
+# test_stdin_seven_only_renders_and_caches_seven_omits_five
+rm -f "$GUL_CACHE"
+GUL_B_SEVEN=$(( $(date +%s) + 86400 ))
+stdin_seven_only_json=$(jq -n --argjson s "$GUL_B_SEVEN" '{
+  workspace: {current_dir: "/tmp"},
+  context_window: {used_percentage: 5},
+  rate_limits: {
+    seven_day: {used_percentage: 45, resets_at: $s}
+  }
+}')
+gul_seven_only_out=$(printf '%s' "$stdin_seven_only_json" | CLAUDE_CONFIG_DIR="$HOME/.claude" bash "$STATUSLINE" 2>/dev/null)
+echo "$gul_seven_only_out" | grep -q '45%'
+check "test_stdin_seven_only_renders_and_caches_seven_omits_five: 7d window renders" $?
+gul_seven_only_pct_count=$(echo "$gul_seven_only_out" | grep -o '%' | wc -l | tr -d ' ')
+assert_eq "test_stdin_seven_only_renders_and_caches_seven_omits_five: only context% + 7d% rendered (5h omitted)" "2" "$gul_seven_only_pct_count"
+assert_eq "test_stdin_seven_only_renders_and_caches_seven_omits_five: 7d cached" "45" "$(jq -r '.seven_day.used_percentage' "$GUL_CACHE" 2>/dev/null)"
+gul_seven_only_cached_five=$(jq -r '.five_hour.used_percentage' "$GUL_CACHE" 2>/dev/null)
+[[ -z "$gul_seven_only_cached_five" || "$gul_seven_only_cached_five" == "null" ]]
+check "test_stdin_seven_only_renders_and_caches_seven_omits_five: 5h not fabricated in cache" $?
+rm -f "$GUL_CACHE"
+
+# ─────────────────────────────────────────────────────────────
 # Area: PR — stdin-first, gh fallback
 # ─────────────────────────────────────────────────────────────
 PRSTDIN_DIR=$(mktemp -d)

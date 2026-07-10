@@ -172,24 +172,18 @@ get_usage_limits() {
     ] | map(tostring) | join("")' 2>/dev/null
   )
 
-  local five_pct five_reset seven_pct seven_reset
-
-  if [[ -n "$stdin_five_pct" && "$stdin_five_pct" != "null" ]]; then
-    five_pct=$stdin_five_pct
-    five_reset=$stdin_five_reset
-    seven_pct=$stdin_seven_pct
-    seven_reset=$stdin_seven_reset
-    write_usage_cache "$five_pct" "$five_reset" "$seven_pct" "$seven_reset"
-  else
-    [[ ! -f "$USAGE_CACHE" ]] && return
-
+  # Cache read, once — every window's fallback source when stdin
+  # doesn't carry it, and the writer's basis for whichever window this
+  # render's stdin doesn't carry (so a partial stdin payload can't
+  # clobber the other window's still-fresh cached data).
+  local cache_fetched_at="" cache_five_pct="" cache_five_reset="" cache_seven_pct="" cache_seven_reset=""
+  if [[ -f "$USAGE_CACHE" ]]; then
     # Gate on fetched_at explicitly rather than trusting jq's `// ""`
     # defaults: an old v0.6.x cache used different field names entirely
     # (utilization instead of used_percentage, ISO resets_at instead of
     # epoch), so this fold comes back empty and is treated as absent —
     # never a fabricated 0%.
-    local fetched_at
-    IFS=$'\x01' read -r fetched_at five_pct five_reset seven_pct seven_reset < <(
+    IFS=$'\x01' read -r cache_fetched_at cache_five_pct cache_five_reset cache_seven_pct cache_seven_reset < <(
       jq -r '[
         (.fetched_at // ""),
         (.five_hour.used_percentage // ""),
@@ -198,18 +192,50 @@ get_usage_limits() {
         (.seven_day.resets_at // "")
       ] | map(tostring) | join("")' "$USAGE_CACHE" 2>/dev/null
     )
-    [[ -z "$fetched_at" || "$fetched_at" == "null" ]] && return
-    [[ "$fetched_at" =~ ^[0-9]+$ ]] || return
 
     # Recency bound: a cache older than this never renders, even though
     # fetched_at itself is valid — 900s comfortably covers the
     # pre-first-response window across a session restart while still
     # guaranteeing yesterday's numbers can never render as current.
-    local cache_age_secs=$(( $(date +%s) - fetched_at ))
-    ((cache_age_secs > 900)) && return
-
-    [[ -z "$five_pct" || "$five_pct" == "null" ]] && return
+    local cache_fresh=1
+    [[ -z "$cache_fetched_at" || "$cache_fetched_at" == "null" || ! "$cache_fetched_at" =~ ^[0-9]+$ ]] && cache_fresh=0
+    if ((cache_fresh)); then
+      local cache_age_secs=$(( $(date +%s) - cache_fetched_at ))
+      ((cache_age_secs > 900)) && cache_fresh=0
+    fi
+    if ((! cache_fresh)); then
+      cache_five_pct="" cache_five_reset="" cache_seven_pct="" cache_seven_reset=""
+    fi
   fi
+
+  # Per-window stdin gate: each window uses stdin when stdin carries it,
+  # falling back independently to the (fresh) cache otherwise — a
+  # payload carrying only one window must never blank out or drop the
+  # other window's still-good data (the C2 bug: gating the ENTIRE branch
+  # on five_hour alone silently dropped a seven_day-only payload).
+  local five_pct="" five_reset="" seven_pct="" seven_reset="" have_stdin=0
+
+  if [[ -n "$stdin_five_pct" && "$stdin_five_pct" != "null" ]]; then
+    five_pct=$stdin_five_pct
+    five_reset=$stdin_five_reset
+    have_stdin=1
+  else
+    five_pct=$cache_five_pct
+    five_reset=$cache_five_reset
+  fi
+
+  if [[ -n "$stdin_seven_pct" && "$stdin_seven_pct" != "null" ]]; then
+    seven_pct=$stdin_seven_pct
+    seven_reset=$stdin_seven_reset
+    have_stdin=1
+  else
+    seven_pct=$cache_seven_pct
+    seven_reset=$cache_seven_reset
+  fi
+
+  ((have_stdin)) && write_usage_cache "$five_pct" "$five_reset" "$seven_pct" "$seven_reset"
+
+  { [[ -z "$five_pct" || "$five_pct" == "null" ]] && [[ -z "$seven_pct" || "$seven_pct" == "null" ]]; } && return
 
   [[ "$five_reset" =~ ^[0-9]+$ ]] || five_reset=""
   [[ "$seven_reset" =~ ^[0-9]+$ ]] || seven_reset=""
