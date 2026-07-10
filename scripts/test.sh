@@ -361,8 +361,9 @@ rm -f "/tmp/.claude_usage_limits_personal.json" "/tmp/.claude_cred_refresh_faile
 rmdir "/tmp/.claude_cred_lock_personal" 2>/dev/null
 
 # ─────────────────────────────────────────────────────────────
-# Area: capture-profile-session.sh (manual provenance-stamped capture,
-# user-run only — never invoked by hook/statusline)
+# Area: capture-profile-session.sh (manual provenance-stamped capture +
+# identity verification probe, user-run only — never invoked by hook/
+# statusline directly; the hook shells out to this script in Task 8)
 # ─────────────────────────────────────────────────────────────
 CAP_DIR=$(mktemp -d)
 CAPSEC=$(mktemp -d)
@@ -372,38 +373,116 @@ echo '{"claudeAiOauth":{"accessToken":"tok_fake_capture","refreshToken":"rtok_fa
 EOF
 chmod +x "$CAPSEC/security"
 
-# Happy path
+# curl stub for the Task 7 identity probe (api/oauth/profile) — keyed on
+# PROFILE_HTTP_CODE / PROFILE_RESPONSE_BODY env vars per scenario.
+CAPCURL=$(mktemp -d)
+cat > "$CAPCURL/curl" <<'EOF'
+#!/bin/bash
+url=""
+for arg in "$@"; do
+  [[ "$arg" == http* ]] && url="$arg"
+done
+[[ "$url" != *"/api/oauth/profile"* ]] && exit 0
+body="${PROFILE_RESPONSE_BODY:-}"
+code="${PROFILE_HTTP_CODE:-200}"
+[[ "$code" == "timeout" ]] && exit 0
+printf '%s\n%s' "$body" "$code"
+EOF
+chmod +x "$CAPCURL/curl"
+CAPPATH="$CAPCURL:$CAPSEC:$PATH"
+
+# Happy path: probe 200 + uuid matches -> verified_account_uuid + verified_at
+# written, captured_login_at seeded from this profile's profileFetchedAt.
 CAP_CONFIG_DIR="$CAP_DIR/claude-personal"
 mkdir -p "$CAP_CONFIG_DIR"
-echo '{"oauthAccount":{"accountUuid":"profile-uuid-abc"}}' > "$CAP_CONFIG_DIR/.claude.json"
+echo '{"oauthAccount":{"accountUuid":"profile-uuid-abc","profileFetchedAt":1783657301823}}' > "$CAP_CONFIG_DIR/.claude.json"
 
-cap_out=$(CLAUDE_CONFIG_DIR="$CAP_CONFIG_DIR" PATH="$CAPSEC:$PATH" bash "$CAPTURE" 2>&1)
+export PROFILE_HTTP_CODE=200
+export PROFILE_RESPONSE_BODY='{"uuid":"profile-uuid-abc","email":"person@example.com"}'
+cap_out=$(CLAUDE_CONFIG_DIR="$CAP_CONFIG_DIR" PATH="$CAPPATH" bash "$CAPTURE" 2>&1)
 cap_status=$?
 check "capture happy path: exits 0" $cap_status
 [[ -f "$CAP_CONFIG_DIR/.credentials.json" ]]; check "capture happy path: file written" $?
 assert_eq "capture happy path: captured_for_uuid == profile uuid" "profile-uuid-abc" "$(jq -r '.claudeline.captured_for_uuid' "$CAP_CONFIG_DIR/.credentials.json" 2>/dev/null)"
+assert_eq "capture happy path (probe match): verified_account_uuid == profile uuid" "profile-uuid-abc" "$(jq -r '.claudeline.verified_account_uuid' "$CAP_CONFIG_DIR/.credentials.json" 2>/dev/null)"
+assert_eq "capture happy path (probe match): captured_login_at seeded from profileFetchedAt" "1783657301823" "$(jq -r '.claudeline.captured_login_at' "$CAP_CONFIG_DIR/.credentials.json" 2>/dev/null)"
+[[ -n "$(jq -r '.claudeline.verified_at // empty' "$CAP_CONFIG_DIR/.credentials.json" 2>/dev/null)" ]]; check "capture happy path (probe match): verified_at is set" $?
 cap_perms=$(stat -f%Lp "$CAP_CONFIG_DIR/.credentials.json" 2>/dev/null || stat -c%a "$CAP_CONFIG_DIR/.credentials.json" 2>/dev/null)
 assert_eq "capture happy path: perms 600" "600" "$cap_perms"
 echo "$cap_out" | grep -q "tok_fake_capture"
 [[ $? -ne 0 ]]; check "capture happy path: no token value on stdout" $?
 
+# Probe 200 + uuid MISMATCH -> abort, no write, loud stderr with both
+# uuids + emails (never tokens), veto artifact.
+CAP_CONFIG_DIR3="$CAP_DIR/claude-personal-mismatch"
+mkdir -p "$CAP_CONFIG_DIR3"
+echo '{"oauthAccount":{"accountUuid":"profile-uuid-abc","profileFetchedAt":1783657301823}}' > "$CAP_CONFIG_DIR3/.claude.json"
+rm -f "/tmp/.claude_cred_capture_vetoed_personal"
+
+export PROFILE_HTTP_CODE=200
+export PROFILE_RESPONSE_BODY='{"uuid":"other-uuid-xyz","email":"other@example.com"}'
+cap_out3=$(CLAUDE_CONFIG_DIR="$CAP_CONFIG_DIR3" PATH="$CAPPATH" bash "$CAPTURE" 2>&1)
+cap_status=$?
+[[ "$cap_status" != "0" ]]; check "capture probe mismatch: exits 1" $?
+[[ ! -f "$CAP_CONFIG_DIR3/.credentials.json" ]]; check "capture probe mismatch: no file written" $?
+[[ -f "/tmp/.claude_cred_capture_vetoed_personal" ]]; check "capture probe mismatch: veto artifact created" $?
+echo "$cap_out3" | grep -q "profile-uuid-abc"
+check "capture probe mismatch: stderr names profile uuid" $?
+echo "$cap_out3" | grep -q "other-uuid-xyz"
+check "capture probe mismatch: stderr names probed uuid" $?
+echo "$cap_out3" | grep -q "other@example.com"
+check "capture probe mismatch: stderr names probed email" $?
+echo "$cap_out3" | grep -q "tok_fake_capture"
+[[ $? -ne 0 ]]; check "capture probe mismatch: no token value on stdout/stderr" $?
+rm -f "/tmp/.claude_cred_capture_vetoed_personal"
+
+# Probe timeout/non-200 -> file WRITTEN but usable-unverified (no
+# verified_account_uuid/verified_at) -> ? stays per Task 6.
+CAP_CONFIG_DIR4="$CAP_DIR/claude-personal-unverified"
+mkdir -p "$CAP_CONFIG_DIR4"
+echo '{"oauthAccount":{"accountUuid":"profile-uuid-abc","profileFetchedAt":1783657301823}}' > "$CAP_CONFIG_DIR4/.claude.json"
+
+export PROFILE_HTTP_CODE=timeout
+export PROFILE_RESPONSE_BODY=''
+CLAUDE_CONFIG_DIR="$CAP_CONFIG_DIR4" PATH="$CAPPATH" bash "$CAPTURE" >/dev/null 2>&1
+cap_status=$?
+check "capture probe timeout: exits 0 (still writes)" $cap_status
+[[ -f "$CAP_CONFIG_DIR4/.credentials.json" ]]; check "capture probe timeout: file written" $?
+assert_eq "capture probe timeout: captured_for_uuid still set" "profile-uuid-abc" "$(jq -r '.claudeline.captured_for_uuid' "$CAP_CONFIG_DIR4/.credentials.json" 2>/dev/null)"
+assert_eq "capture probe timeout: verified_account_uuid absent (unverified)" "" "$(jq -r '.claudeline.verified_account_uuid // empty' "$CAP_CONFIG_DIR4/.credentials.json" 2>/dev/null)"
+assert_eq "capture probe timeout: verified_at absent (unverified)" "" "$(jq -r '.claudeline.verified_at // empty' "$CAP_CONFIG_DIR4/.credentials.json" 2>/dev/null)"
+
+CAP_CONFIG_DIR5="$CAP_DIR/claude-personal-unparseable"
+mkdir -p "$CAP_CONFIG_DIR5"
+echo '{"oauthAccount":{"accountUuid":"profile-uuid-abc","profileFetchedAt":1783657301823}}' > "$CAP_CONFIG_DIR5/.claude.json"
+
+export PROFILE_HTTP_CODE=500
+export PROFILE_RESPONSE_BODY='not-json'
+CLAUDE_CONFIG_DIR="$CAP_CONFIG_DIR5" PATH="$CAPPATH" bash "$CAPTURE" >/dev/null 2>&1
+cap_status=$?
+check "capture probe non-200: exits 0 (still writes)" $cap_status
+[[ -f "$CAP_CONFIG_DIR5/.credentials.json" ]]; check "capture probe non-200: file written" $?
+assert_eq "capture probe non-200: verified_account_uuid absent (unverified)" "" "$(jq -r '.claudeline.verified_account_uuid // empty' "$CAP_CONFIG_DIR5/.credentials.json" 2>/dev/null)"
+
+unset PROFILE_HTTP_CODE PROFILE_RESPONSE_BODY
+
 # Missing uuid -> abort, no file
 CAP_CONFIG_DIR2="$CAP_DIR/claude-personal-nouuid"
 mkdir -p "$CAP_CONFIG_DIR2"
 echo '{}' > "$CAP_CONFIG_DIR2/.claude.json"
-CLAUDE_CONFIG_DIR="$CAP_CONFIG_DIR2" PATH="$CAPSEC:$PATH" bash "$CAPTURE" >/dev/null 2>&1
+CLAUDE_CONFIG_DIR="$CAP_CONFIG_DIR2" PATH="$CAPPATH" bash "$CAPTURE" >/dev/null 2>&1
 cap_status=$?
 [[ "$cap_status" != "0" ]]; check "capture missing uuid: exits 1" $?
 [[ ! -f "$CAP_CONFIG_DIR2/.credentials.json" ]]; check "capture missing uuid: no file written" $?
 
 # ACCOUNT_ASSUMED=1 (CLAUDE_CONFIG_DIR unset) -> refuse, no file
 rm -f "$HOME/.claude/.credentials.json"
-PATH="$CAPSEC:$PATH" bash -c "unset CLAUDE_CONFIG_DIR; bash '$CAPTURE'" >/dev/null 2>&1
+PATH="$CAPPATH" bash -c "unset CLAUDE_CONFIG_DIR; bash '$CAPTURE'" >/dev/null 2>&1
 cap_status=$?
 [[ "$cap_status" != "0" ]]; check "capture ACCOUNT_ASSUMED=1: exits 1" $?
 [[ ! -f "$HOME/.claude/.credentials.json" ]]; check "capture ACCOUNT_ASSUMED=1: no file written" $?
 
-rm -rf "$CAP_DIR" "$CAPSEC"
+rm -rf "$CAP_DIR" "$CAPSEC" "$CAPCURL"
 
 # ─────────────────────────────────────────────────────────────
 # Area: render markers (shared_login_marker / unverifiable_marker)
