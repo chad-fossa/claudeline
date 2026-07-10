@@ -21,11 +21,9 @@ readonly MAGENTA_BRIGHT=$'\033[95m'
 # Cross-platform helpers (BSD on macOS, GNU on Linux)
 # ─────────────────────────────────────────────────────────────
 if [[ "$OSTYPE" == "darwin"* ]]; then
-  parse_iso_utc() { TZ=UTC date -jf "%Y-%m-%dT%H:%M:%S" "$1" "+%s" 2>/dev/null; }
   fmt_epoch()     { date -r "$1" "$2" 2>/dev/null; }
   file_mtime()    { stat -f%m "$1" 2>/dev/null; }
 else
-  parse_iso_utc() { date -u -d "$1" "+%s" 2>/dev/null; }
   fmt_epoch()     { date -d "@$1" "$2" 2>/dev/null; }
   file_mtime()    { stat -c%Y "$1" 2>/dev/null; }
 fi
@@ -47,7 +45,8 @@ CWD=$(echo "$INPUT" | jq -r '.workspace.current_dir // .workspace.project_dir //
 # ─────────────────────────────────────────────────────────────
 # Detect from CLAUDE_CONFIG_DIR env var (set by shell alias), not transcript_path
 # (transcript_path follows symlinks, so personal→work projects resolve to /.claude/)
-# keep in sync with hooks/show-usage-limits.sh detect_account() — scripts/test.sh asserts they match
+# Sole copy since v0.7.0 — usage now arrives on stdin, so there's no
+# separate hook/capture script needing an identical copy to stay in sync.
 detect_account() {
   ACCOUNT_ASSUMED=0
   if [[ -z "${CLAUDE_CONFIG_DIR+x}" ]]; then
@@ -80,9 +79,8 @@ else
   COLS=${COLUMNS:-80}
 fi
 
-# Every cache/lock statusline itself writes lives under the same per-user
-# 0700 runtime dir the hook and capture script use — see
-# hooks/show-usage-limits.sh for the full rationale. Basenames unchanged.
+# Every cache/lock statusline writes lives under this per-user 0700
+# runtime dir, not bare /tmp.
 RUNTIME_DIR="/tmp/claudeline-$(id -u)"
 mkdir -p -m 700 "$RUNTIME_DIR" 2>/dev/null
 readonly RUNTIME_DIR
@@ -95,9 +93,7 @@ readonly RUNTIME_DIR
 # directory means owning every lock/artifact/sentinel/cache claudeline
 # writes under it. Verify ownership (and rule out a symlink, which -d
 # would follow and -O would validate against the SYMLINK TARGET's owner,
-# not the path itself) before trusting anything under RUNTIME_DIR this
-# run. hooks/show-usage-limits.sh + scripts/capture-profile-session.sh
-# inline this identically; scripts/test.sh asserts all three copies match.
+# not the path itself) before trusting anything under RUNTIME_DIR this run.
 verify_runtime_dir() {
   RUNTIME_DIR_SAFE=1
   if [[ -L "$RUNTIME_DIR" || ! -d "$RUNTIME_DIR" || ! -O "$RUNTIME_DIR" ]]; then
@@ -109,124 +105,122 @@ verify_runtime_dir
 readonly RUNTIME_DIR_SAFE
 
 # ─────────────────────────────────────────────────────────────
-# Usage limits (read from cache populated by SessionStart hook)
-# Cache is also kept warm by background refresh below — the
-# SessionStart hook seeds it, and statusline renders refresh it
-# when it exceeds USAGE_CACHE_TTL_SECONDS.
+# Usage limits — Claude Code hands each session its OWN usage on stdin
+# (rate_limits.five_hour/.seven_day), so there's nothing to fetch: read
+# it straight off $INPUT, render it, and cache it synchronously for the
+# rare render where stdin arrives before the session's first API
+# response. Cache schema mirrors stdin verbatim; resets_at is a raw
+# epoch int, not a string to parse.
 # ─────────────────────────────────────────────────────────────
 readonly USAGE_CACHE="${RUNTIME_DIR}/.claude_usage_limits_${ACCOUNT_ID}.json"
-readonly USAGE_CACHE_TTL_SECONDS=300
 
-# Prefer the active profile's own hook; fall back to the work install
-# if the profile doesn't have one (e.g. a personal dir with no hooks/).
-resolve_usage_refresh_hook() {
-  local preferred="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/show-usage-limits.sh"
-  if [[ -x "$preferred" ]]; then
-    echo "$preferred"
-  else
-    echo "$HOME/.claude/hooks/show-usage-limits.sh"
-  fi
-}
-readonly USAGE_REFRESH_HOOK="$(resolve_usage_refresh_hook)"
-
-# Spawn a background refresh of the usage cache when it's stale.
-# Render uses whatever cache is currently on disk (no API latency); the
-# refreshed data appears on the *next* statusline render. A short-lived
-# lock prevents stampede when multiple renders fire close together.
-maybe_refresh_usage_cache() {
+write_usage_cache() {
   [[ "$RUNTIME_DIR_SAFE" != "1" ]] && return
-  [[ ! -x "$USAGE_REFRESH_HOOK" ]] && return
+  local five_pct=$1 five_reset=$2 seven_pct=$3 seven_reset=$4
+  jq -n \
+    --argjson five_pct "${five_pct:-null}" \
+    --argjson five_reset "${five_reset:-null}" \
+    --argjson seven_pct "${seven_pct:-null}" \
+    --argjson seven_reset "${seven_reset:-null}" \
+    --argjson fetched_at "$(date +%s)" \
+    '{five_hour: {used_percentage: $five_pct, resets_at: $five_reset},
+      seven_day: {used_percentage: $seven_pct, resets_at: $seven_reset},
+      fetched_at: $fetched_at}' > "$USAGE_CACHE" 2>/dev/null
+}
 
-  local now cache_mtime
-  now=$(date +%s)
-  cache_mtime=$(file_mtime "$USAGE_CACHE" || echo 0)
-  (( now - cache_mtime <= USAGE_CACHE_TTL_SECONDS )) && return
+# Renders one window's "label:pct%" segment. reset_epoch drives the
+# label (5h -> local hour, 7d -> m/d); falls back to the default label
+# (5h/7d) if fmt_epoch can't format it.
+render_usage_segment() {
+  local default_label=$1 pct_raw=$2 reset_epoch=$3 date_fmt=$4 lowercase=$5
+  local pct color label formatted
+  pct=$(awk "BEGIN {printf \"%.0f\", $pct_raw}")
 
-  local lock="${RUNTIME_DIR}/.claude_usage_refresh_lock_${ACCOUNT_ID}"
-  if [[ -f "$lock" ]]; then
-    local lock_age=$((now - $(file_mtime "$lock" || echo 0)))
-    (( lock_age < 30 )) && return
-    rm -f "$lock"
+  color=$GREEN
+  ((pct >= 80)) && color=$RED
+  ((pct >= 50 && pct < 80)) && color=$YELLOW
+
+  label=$default_label
+  if [[ -n "$reset_epoch" ]]; then
+    formatted=$(fmt_epoch "$reset_epoch" "$date_fmt")
+    [[ "$lowercase" == "1" ]] && formatted=$(echo "$formatted" | tr '[:upper:]' '[:lower:]')
+    [[ -n "$formatted" ]] && label=$formatted
   fi
-  touch "$lock"
-  ( "$USAGE_REFRESH_HOOK" </dev/null >/dev/null 2>&1; rm -f "$lock" ) &
+
+  printf '%s%s:%s%s%d%%%s' "$DIM" "$label" "$RESET" "$color" "$pct" "$RESET"
 }
 
 get_usage_limits() {
   # A cache under a RUNTIME_DIR we don't own could be attacker-planted —
   # render no usage segment rather than trust its contents this run.
   [[ "$RUNTIME_DIR_SAFE" != "1" ]] && return
-  if [[ ! -f "$USAGE_CACHE" ]]; then
-    return
-  fi
 
-  # Single jq invocation for every field this function needs (fetched_at
-  # gate, the two utilizations + reset times, token_source, and
-  # provenance — the last two used to be a separate jq call plus a whole
-  # extra file read via file_provenance_matches, now deleted; provenance
-  # is computed once at cache-write time by the hook's compute_provenance
-  # instead). A missing provenance field (a pre-existing cache from
-  # before this changed) defaults to "unverified", same as a fresh
-  # unverified capture — the ? marker stays, per v0.5.0.
-  # \x01 (not @tsv's tab) on purpose: bash's `read` classifies tab as
-  # "IFS whitespace" no matter what IFS is set to, so it squashes/strips
-  # LEADING and consecutive tabs — silently misaligning every field
-  # whenever fetched_at (the first, often-empty, field) is empty. \x01
-  # isn't whitespace, so empty leading/middle fields read correctly.
-  local fetched_at five_hour seven_day reset5 reset7 token_source provenance
-  IFS=$'\x01' read -r fetched_at five_hour seven_day reset5 reset7 token_source provenance < <(
-    jq -r '[
-      (.fetched_at // ""),
-      (.five_hour.utilization // 0),
-      (.seven_day.utilization // 0),
-      (.five_hour.resets_at // ""),
-      (.seven_day.resets_at // ""),
-      (.token_source // "unknown"),
-      (.provenance // "unverified")
-    ] | map(tostring) | join("\u0001")' "$USAGE_CACHE" 2>/dev/null
+  local stdin_five_pct stdin_five_reset stdin_seven_pct stdin_seven_reset
+  IFS=$'\x01' read -r stdin_five_pct stdin_five_reset stdin_seven_pct stdin_seven_reset < <(
+    printf '%s' "$INPUT" | jq -r '[
+      (.rate_limits.five_hour.used_percentage // ""),
+      (.rate_limits.five_hour.resets_at // ""),
+      (.rate_limits.seven_day.used_percentage // ""),
+      (.rate_limits.seven_day.resets_at // "")
+    ] | map(tostring) | join("")' 2>/dev/null
   )
 
-  # A cache written only by handle_refresh_failure's cold-start artifact
-  # (pre-fix) or any cache missing fetched_at/five_hour has no real usage
-  # data — jq's `// 0` above would otherwise render a fabricated "0%".
-  # Gate on fetched_at directly instead of trusting the defaulted values.
-  [[ -z "$fetched_at" ]] && return
+  local five_pct five_reset seven_pct seven_reset
 
-  if [[ -z "$five_hour" || "$five_hour" == "null" ]]; then
-    return
+  if [[ -n "$stdin_five_pct" && "$stdin_five_pct" != "null" ]]; then
+    five_pct=$stdin_five_pct
+    five_reset=$stdin_five_reset
+    seven_pct=$stdin_seven_pct
+    seven_reset=$stdin_seven_reset
+    write_usage_cache "$five_pct" "$five_reset" "$seven_pct" "$seven_reset"
+  else
+    [[ ! -f "$USAGE_CACHE" ]] && return
+
+    # Gate on fetched_at explicitly rather than trusting jq's `// ""`
+    # defaults: an old v0.6.x cache used different field names entirely
+    # (utilization instead of used_percentage, ISO resets_at instead of
+    # epoch), so this fold comes back empty and is treated as absent —
+    # never a fabricated 0%.
+    local fetched_at
+    IFS=$'\x01' read -r fetched_at five_pct five_reset seven_pct seven_reset < <(
+      jq -r '[
+        (.fetched_at // ""),
+        (.five_hour.used_percentage // ""),
+        (.five_hour.resets_at // ""),
+        (.seven_day.used_percentage // ""),
+        (.seven_day.resets_at // "")
+      ] | map(tostring) | join("")' "$USAGE_CACHE" 2>/dev/null
+    )
+    [[ -z "$fetched_at" || "$fetched_at" == "null" ]] && return
+    [[ -z "$five_pct" || "$five_pct" == "null" ]] && return
   fi
 
-  # Convert reset times from UTC to local display format
-  # Strip fractional seconds AND timezone suffix for clean parsing
-  local label5="5h" label7="7d" epoch clean_ts
-  if [[ -n "$reset5" ]]; then
-    clean_ts="${reset5%%[.+]*}"
-    epoch=$(parse_iso_utc "$clean_ts") \
-      && label5=$(fmt_epoch "$epoch" "+%-I%p" | tr '[:upper:]' '[:lower:]') || label5="5h"
+  [[ "$five_reset" =~ ^[0-9]+$ ]] || five_reset=""
+  [[ "$seven_reset" =~ ^[0-9]+$ ]] || seven_reset=""
+
+  # Per-window rollover: each window's resets_at is checked
+  # independently (5h rolls far more often than 7d) — an expired window
+  # drops its own segment without affecting the other.
+  local now seg5="" seg7=""
+  now=$(date +%s)
+
+  if [[ -n "$five_pct" && "$five_pct" != "null" ]] \
+    && { [[ -z "$five_reset" ]] || (( now <= five_reset )); }; then
+    seg5=$(render_usage_segment "5h" "$five_pct" "$five_reset" "+%-I%p" 1)
   fi
-  if [[ -n "$reset7" ]]; then
-    clean_ts="${reset7%%[.+]*}"
-    epoch=$(parse_iso_utc "$clean_ts") \
-      && label7=$(fmt_epoch "$epoch" "+%m/%d") || label7="7d"
+
+  if [[ -n "$seven_pct" && "$seven_pct" != "null" ]] \
+    && { [[ -z "$seven_reset" ]] || (( now <= seven_reset )); }; then
+    seg7=$(render_usage_segment "7d" "$seven_pct" "$seven_reset" "+%m/%d" 0)
   fi
 
-  # Utilization values are already percentages (e.g., 15.0 = 15%)
-  local pct5 pct7 color5 color7
-  pct5=$(awk "BEGIN {printf \"%.0f\", $five_hour}")
-  pct7=$(awk "BEGIN {printf \"%.0f\", $seven_day}")
+  local combined="$seg5"
+  if [[ -n "$seg7" ]]; then
+    [[ -n "$combined" ]] && combined="$combined $seg7" || combined="$seg7"
+  fi
+  [[ -z "$combined" ]] && return
 
-  color5=$GREEN
-  ((pct5 >= 80)) && color5=$RED
-  ((pct5 >= 50 && pct5 < 80)) && color5=$YELLOW
-
-  color7=$GREEN
-  ((pct7 >= 80)) && color7=$RED
-  ((pct7 >= 50 && pct7 < 80)) && color7=$YELLOW
-
-  local unverifiable
-  unverifiable=$(unverifiable_marker "$(profile_uuid_state)" "$token_source" "$provenance")
-
-  printf '%s%s:%s%s%d%%%s %s%s:%s%s%d%%%s %s│%s%s' "$DIM" "$label5" "$RESET" "$color5" "$pct5" "$RESET" "$DIM" "$label7" "$RESET" "$color7" "$pct7" "$RESET" "$DIM" "$RESET" "$unverifiable"
+  printf '%s %s│%s' "$combined" "$DIM" "$RESET"
 }
 
 # ─────────────────────────────────────────────────────────────
@@ -332,9 +326,8 @@ get_branch() {
 }
 
 get_pr_number() {
-  # Same rationale as get_usage_limits/maybe_refresh_usage_cache — skip
-  # the PR cache/lock entirely rather than trust or write to a
-  # RUNTIME_DIR we don't own.
+  # Same rationale as get_usage_limits — skip the PR cache/lock entirely
+  # rather than trust or write to a RUNTIME_DIR we don't own.
   [[ "$RUNTIME_DIR_SAFE" != "1" ]] && return
   local repo_name=$1 branch=$2
   local cache="${RUNTIME_DIR}/.claude_pr_cache_${repo_name}_${ACCOUNT_ID}"
@@ -431,7 +424,10 @@ truncate() {
 # ─────────────────────────────────────────────────────────────
 # Cross-profile identity (keychain has one OAuth slot — see
 # anthropics/claude-code#20553 — so both profiles can silently
-# share the same logged-in account)
+# share the same logged-in account). Since v0.7.0 usage itself no
+# longer depends on the keychain (it arrives per-session on stdin), so
+# this is purely a "did I also log in as the same account elsewhere"
+# signal, not a usage-trust signal.
 # ─────────────────────────────────────────────────────────────
 profile_uuid_state() {
   local work_dir="$HOME/.claude" personal_dir="$HOME/.claude-personal"
@@ -458,34 +454,6 @@ shared_login_marker() {
   [[ "$state" == "equal" ]] && printf '%s=%s' "$DIM" "$RESET"
 }
 
-# state: profile_uuid_state() result. token_source/provenance are read
-# straight from the usage cache (get_usage_limits' single jq fold) — both
-# are computed once by the hook at fetch/cache-write time
-# (compute_provenance in hooks/show-usage-limits.sh), not recomputed
-# per-render (that used to cost an extra jq spawn plus a second file read
-# via the now-deleted file_provenance_matches). provenance is one of the
-# explicit strings verified_match | mismatch | unverified — never
-# exit-code-style 0/1, which was a standing inversion trap (0 read as
-# "match" here, opposite of 0=false everywhere else). file-refresh-failed
-# always wins (stale numbers + broken refresh, distinct from the
-# cross-profile-ambiguity ?). file+verified_match suppresses ? — anything
-# else (mismatch, unverified — including a pre-existing cache with no
-# provenance field, which get_usage_limits defaults to "unverified" —
-# unknown, keychain) renders it exactly as v0.5.0 did. No arg defaults:
-# every caller passes state/token_source/provenance explicitly.
-unverifiable_marker() {
-  local state=$1 token_source=$2 provenance=$3
-
-  if [[ "$token_source" == "file-refresh-failed" ]]; then
-    printf ' %s%s!%s' "$DIM" "$RED" "$RESET"
-    return
-  fi
-
-  [[ "$token_source" == "file" && "$provenance" == "verified_match" ]] && return
-
-  [[ "$OSTYPE" == darwin* && "$state" == "differ" ]] && printf ' %s?%s' "$DIM" "$RESET"
-}
-
 # ─────────────────────────────────────────────────────────────
 # Build output
 # ─────────────────────────────────────────────────────────────
@@ -506,21 +474,37 @@ build_output() {
   if is_git_repo; then
     repo=$(get_repo_name)
     branch=$(get_branch)
-    pr=$(get_pr_number "$repo" "$branch")
-    work_status=$(get_work_status)
-    sync_status=$(get_sync_status)
 
-    # Build PR hyperlink if we have a PR
+    # PR: stdin-first (Claude Code already resolved it for this session),
+    # falling back to get_pr_number's gh lookup only when stdin doesn't
+    # carry it.
+    local stdin_pr_number stdin_pr_url
+    stdin_pr_number=$(echo "$INPUT" | jq -r '.pr.number // empty')
+    stdin_pr_url=$(echo "$INPUT" | jq -r '.pr.url // empty')
+
     pr_link=""
-    if [[ -n "$pr" ]]; then
-      repo_url=$(get_repo_url)
-      pr_num="${pr#\#}"  # Remove # prefix
-      if [[ -n "$repo_url" ]]; then
-        pr_link=$(hyperlink "${repo_url}/pull/${pr_num}" "$pr")
+    if [[ -n "$stdin_pr_number" && "$stdin_pr_number" != "null" ]]; then
+      pr="#${stdin_pr_number}"
+      if [[ -n "$stdin_pr_url" && "$stdin_pr_url" != "null" ]]; then
+        pr_link=$(hyperlink "$stdin_pr_url" "$pr")
       else
         pr_link="$pr"
       fi
+    else
+      pr=$(get_pr_number "$repo" "$branch")
+      if [[ -n "$pr" ]]; then
+        repo_url=$(get_repo_url)
+        pr_num="${pr#\#}"
+        if [[ -n "$repo_url" ]]; then
+          pr_link=$(hyperlink "${repo_url}/pull/${pr_num}" "$pr")
+        else
+          pr_link="$pr"
+        fi
+      fi
     fi
+
+    work_status=$(get_work_status)
+    sync_status=$(get_sync_status)
 
     # Full: [W] bar% usage | repo:branch #PR ↔↑
     printf '%s%s %d%% ' "$acct_prefix" "$(progress_bar "$percent")" "$percent"
@@ -552,6 +536,5 @@ build_output() {
 # ─────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────
-maybe_refresh_usage_cache
 build_output
 exit 0

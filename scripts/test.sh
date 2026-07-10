@@ -1225,179 +1225,146 @@ rmdir "${RUNTIME_DIR}/.claude_cred_lock_personal" 2>/dev/null
 rm -rf "$CAP_DIR" "$CAPSEC" "$CAPCURL"
 
 # ─────────────────────────────────────────────────────────────
-# Area: render markers (shared_login_marker / unverifiable_marker)
+# Area: render markers (shared_login_marker). unverifiable_marker (the
+# `?`/`!` markers) is deleted in v0.7.0 — usage now arrives per-session
+# on stdin, so there's no fetch-time credential state left to flag.
 # ─────────────────────────────────────────────────────────────
 DIM=$'\033[2m'
 RESET=$'\033[0m'
 SLM_SRC=$(extract_func "$STATUSLINE" shared_login_marker)
-UVM_SRC=$(extract_func "$STATUSLINE" unverifiable_marker)
 eval "$SLM_SRC"
-eval "$UVM_SRC"
 
 marker=$(shared_login_marker "equal")
-assert_eq "equal state -> shared-login = marker" "${DIM}=${RESET}" "$marker"
+assert_eq "test_shared_login_marker_fires_on_equal_uuids" "${DIM}=${RESET}" "$marker"
 
 marker=$(shared_login_marker "differ")
 assert_eq "differ state -> no shared-login marker" "" "$marker"
 
-OSTYPE="darwin24"
-marker=$(unverifiable_marker "differ" "unknown" "unverified")
-assert_eq "darwin + differ -> ? marker" " ${DIM}?${RESET}" "$marker"
-
-marker=$(unverifiable_marker "equal" "unknown" "unverified")
-assert_eq "darwin + equal -> no ? marker" "" "$marker"
-
-marker=$(unverifiable_marker "single" "unknown" "unverified")
-assert_eq "darwin + single -> no ? marker" "" "$marker"
-
-marker=$(unverifiable_marker "unknown" "unknown" "unverified")
-assert_eq "darwin + unknown -> no ? marker" "" "$marker"
-
-OSTYPE="linux-gnu"
-marker=$(unverifiable_marker "differ" "unknown" "unverified")
-assert_eq "linux + differ -> no ? marker (darwin-only)" "" "$marker"
-
-OSTYPE="darwin24"
-RED=$'\033[31m'
-
-# token_source/provenance-aware suppression: file+verified_match
-# suppresses ?, file+mismatch/unverified keeps it, unknown/keychain
-# behave like v0.5.0, and file-refresh-failed always renders !
-# regardless of state/provenance. provenance is now one of the explicit
-# strings verified_match|mismatch|unverified (never exit-code-style 0/1).
-marker=$(unverifiable_marker "differ" "file" "verified_match")
-assert_eq "token_source=file + provenance=verified_match -> no ? marker" "" "$marker"
-
-marker=$(unverifiable_marker "differ" "file" "mismatch")
-assert_eq "token_source=file + provenance=mismatch -> ? stays" " ${DIM}?${RESET}" "$marker"
-
-marker=$(unverifiable_marker "differ" "unknown" "unverified")
-assert_eq "token_source=unknown -> ? per v0.5.0" " ${DIM}?${RESET}" "$marker"
-
-marker=$(unverifiable_marker "differ" "keychain" "unverified")
-assert_eq "token_source=keychain -> ? per v0.5.0" " ${DIM}?${RESET}" "$marker"
-
-marker=$(unverifiable_marker "equal" "file-refresh-failed" "unverified")
-assert_eq "token_source=file-refresh-failed -> ! marker" " ${DIM}${RED}!${RESET}" "$marker"
-
-# provenance=unverified (no verified capture yet — e.g. captured_for_uuid
-# stamped but never probed) must never suppress ? even when
-# token_source=file — this is the hard condition unverifiable_marker enforces.
-marker=$(unverifiable_marker "differ" "file" "unverified")
-assert_eq "token_source=file + provenance=unverified -> ? stays, suppression never fires without a verified capture" " ${DIM}?${RESET}" "$marker"
+# ─────────────────────────────────────────────────────────────
+# Area: assumed-account label dims (CLAUDE_CONFIG_DIR unset)
+# ─────────────────────────────────────────────────────────────
+assumed_out=$(echo '{"workspace":{"current_dir":"/tmp"},"context_window":{"used_percentage":5}}' | env -u CLAUDE_CONFIG_DIR bash "$STATUSLINE" 2>/dev/null)
+printf '%s' "$assumed_out" | grep -qF "${DIM}[W]"
+check "test_assumed_account_label_dims: unset CLAUDE_CONFIG_DIR dims [W]" $?
 
 # ─────────────────────────────────────────────────────────────
-# Area: get_usage_limits cold-start / warm-cache gating (C5 — cold start
-# must not fabricate numbers). A refresh-failure cache with no real
-# five_hour/fetched_at data must render NO usage segment at all (not a
-# fabricated "0%"); a warm cache (real data + token_source=
-# file-refresh-failed) still renders stale numbers + the ! marker exactly
-# as before.
+# Area: usage from stdin + epoch cache schema (v0.7.0 — stdin is the
+# sole source of usage; the old OAuth-fetch cache schema, and any `?`/`!`
+# marker derived from it, is gone).
 # ─────────────────────────────────────────────────────────────
-GUL_DIR=$(mktemp -d)
-GUL_CONFIG_DIR="$GUL_DIR/claude-personal"
-mkdir -p "$GUL_CONFIG_DIR"
-rm -f "${RUNTIME_DIR}/.claude_usage_limits_personal.json"
+GUL_CACHE="${RUNTIME_DIR}/.claude_usage_limits_work.json"
+rm -f "$GUL_CACHE"
+NO_RATE_LIMITS_JSON='{"workspace":{"current_dir":"/tmp"},"context_window":{"used_percentage":5}}'
 
-# Cold-start: cache has only token_source (no fetched_at/five_hour) ->
-# no usage segment, no fabricated 0% anywhere. used_percentage=7 (not 10)
-# so the context-window "7%" can't be mistaken for a fabricated "...0%".
-cat > "${RUNTIME_DIR}/.claude_usage_limits_personal.json" <<'EOF'
-{"token_source":"file-refresh-failed"}
+# test_stdin_usage_rendered_and_cached
+GUL_FIVE_EPOCH=$(( $(date +%s) + 3600 ))
+GUL_SEVEN_EPOCH=$(( $(date +%s) + 86400 ))
+stdin_usage_json=$(jq -n --argjson f "$GUL_FIVE_EPOCH" --argjson s "$GUL_SEVEN_EPOCH" '{
+  workspace: {current_dir: "/tmp"},
+  context_window: {used_percentage: 5},
+  rate_limits: {
+    five_hour: {used_percentage: 10, resets_at: $f},
+    seven_day: {used_percentage: 16, resets_at: $s}
+  }
+}')
+gul_out=$(printf '%s' "$stdin_usage_json" | CLAUDE_CONFIG_DIR="$HOME/.claude" bash "$STATUSLINE" 2>/dev/null)
+echo "$gul_out" | grep -q '10%'
+check "test_stdin_usage_rendered_and_cached: 5h renders 10%" $?
+echo "$gul_out" | grep -q '16%'
+check "test_stdin_usage_rendered_and_cached: 7d renders 16%" $?
+[[ -f "$GUL_CACHE" ]]; check "test_stdin_usage_rendered_and_cached: cache written" $?
+assert_eq "test_stdin_usage_rendered_and_cached: cache used_percentage" "10" "$(jq -r '.five_hour.used_percentage' "$GUL_CACHE" 2>/dev/null)"
+assert_eq "test_stdin_usage_rendered_and_cached: cache resets_at is a raw epoch int" "$GUL_FIVE_EPOCH" "$(jq -r '.five_hour.resets_at' "$GUL_CACHE" 2>/dev/null)"
+gul_fetched_at=$(jq -r '.fetched_at' "$GUL_CACHE" 2>/dev/null)
+[[ -n "$gul_fetched_at" && "$gul_fetched_at" != "null" ]]; check "test_stdin_usage_rendered_and_cached: cache has fetched_at" $?
+
+# test_stdin_absent_renders_from_fresh_cache
+gul_out2=$(printf '%s' "$NO_RATE_LIMITS_JSON" | CLAUDE_CONFIG_DIR="$HOME/.claude" bash "$STATUSLINE" 2>/dev/null)
+echo "$gul_out2" | grep -q '10%'
+check "test_stdin_absent_renders_from_fresh_cache: 5h renders from cache" $?
+echo "$gul_out2" | grep -q '16%'
+check "test_stdin_absent_renders_from_fresh_cache: 7d renders from cache" $?
+
+# test_stdin_absent_no_cache_no_segment. Checks for the "5h:"/"7d:"
+# usage-label pattern specifically (not a blanket %-digit grep), since
+# the context-window segment always renders its own percentage and would
+# otherwise produce a false failure here.
+rm -f "$GUL_CACHE"
+gul_out3=$(printf '%s' "$NO_RATE_LIMITS_JSON" | CLAUDE_CONFIG_DIR="$HOME/.claude" bash "$STATUSLINE" 2>/dev/null)
+echo "$gul_out3" | grep -Eq '(5h|7d):[0-9]+%'
+[[ $? -ne 0 ]]; check "test_stdin_absent_no_cache_no_segment: no usage segment rendered" $?
+
+# test_per_window_rollover_5h_expired_7d_valid
+gul_past=$(( $(date +%s) - 3600 ))
+gul_future=$(( $(date +%s) + 86400 ))
+jq -n --argjson f "$gul_past" --argjson s "$gul_future" --argjson now "$(date +%s)" \
+  '{five_hour:{used_percentage:99,resets_at:$f},seven_day:{used_percentage:22,resets_at:$s},fetched_at:$now}' > "$GUL_CACHE"
+gul_out4=$(printf '%s' "$NO_RATE_LIMITS_JSON" | CLAUDE_CONFIG_DIR="$HOME/.claude" bash "$STATUSLINE" 2>/dev/null)
+echo "$gul_out4" | grep -q '99%'
+[[ $? -ne 0 ]]; check "test_per_window_rollover_5h_expired_7d_valid: expired 5h segment dropped" $?
+echo "$gul_out4" | grep -q '22%'
+check "test_per_window_rollover_5h_expired_7d_valid: valid 7d segment still renders" $?
+
+# test_old_schema_cache_treated_as_absent — a real v0.6.x cache shape
+# (utilization + ISO resets_at + token_source/provenance, no
+# used_percentage field at all) must render no segment and never a
+# fabricated 0%, even though it still has a real fetched_at.
+cat > "$GUL_CACHE" <<EOF
+{"five_hour":{"utilization":50,"resets_at":"2026-01-01T00:00:00Z"},"seven_day":{"utilization":33,"resets_at":"2026-01-08T00:00:00Z"},"fetched_at":$(date +%s),"token_source":"file","provenance":"verified_match"}
 EOF
-gul_out=$(echo '{"workspace":{"current_dir":"/tmp"},"context_window":{"used_percentage":7}}' | CLAUDE_CONFIG_DIR="$GUL_CONFIG_DIR" bash "$STATUSLINE" 2>/dev/null)
-echo "$gul_out" | grep -q '5h:'
-[[ $? -ne 0 ]]; check "cold-start refresh failure: no usage segment rendered" $?
-echo "$gul_out" | grep -q '0%'
-[[ $? -ne 0 ]]; check "cold-start refresh failure: no fabricated 0% anywhere" $?
+gul_out5=$(printf '%s' "$NO_RATE_LIMITS_JSON" | CLAUDE_CONFIG_DIR="$HOME/.claude" bash "$STATUSLINE" 2>/dev/null)
+echo "$gul_out5" | grep -q '50%'
+[[ $? -ne 0 ]]; check "test_old_schema_cache_treated_as_absent: old-schema cache never renders" $?
+echo "$gul_out5" | grep -Eq '(^|[^0-9])0%'
+[[ $? -ne 0 ]]; check "test_old_schema_cache_treated_as_absent: never fabricates 0%" $?
 
-# Warm cache: real data present + token_source=file-refresh-failed ->
-# stale numbers still render, plus the ! marker (preserved behavior).
-cat > "${RUNTIME_DIR}/.claude_usage_limits_personal.json" <<EOF
-{"five_hour":{"utilization":42},"seven_day":{"utilization":7},"fetched_at":$(date +%s),"token_source":"file-refresh-failed"}
-EOF
-gul_out2=$(echo '{"workspace":{"current_dir":"/tmp"},"context_window":{"used_percentage":7}}' | CLAUDE_CONFIG_DIR="$GUL_CONFIG_DIR" bash "$STATUSLINE" 2>/dev/null)
-echo "$gul_out2" | grep -q '42%'
-check "warm-cache refresh failure: stale numbers still render" $?
-echo "$gul_out2" | grep -q '!'
-check "warm-cache refresh failure: ! marker still renders" $?
-
-# get_usage_limits composition: cache seeded with each provenance/
-# token_source combo -> assert the exact ? marker behavior in the FULL
-# statusline printf output (covers the cache-fold -> unverifiable_marker
-# wiring end to end, not just the isolated function). Needs
-# profile_uuid_state()="differ" so ? is even eligible to render.
-echo '{"oauthAccount":{"accountUuid":"gul-work-uuid"}}' > "$HOME/.claude/.claude.json"
-echo '{"oauthAccount":{"accountUuid":"gul-personal-uuid"}}' > "$HOME/.claude-personal/.claude.json"
-
-cat > "${RUNTIME_DIR}/.claude_usage_limits_personal.json" <<EOF
-{"five_hour":{"utilization":10},"seven_day":{"utilization":5},"fetched_at":$(date +%s),"token_source":"file","provenance":"verified_match"}
-EOF
-gul_out3=$(echo '{"workspace":{"current_dir":"/tmp"},"context_window":{"used_percentage":7}}' | CLAUDE_CONFIG_DIR="$GUL_CONFIG_DIR" bash "$STATUSLINE" 2>/dev/null)
-echo "$gul_out3" | grep -q '?'
-[[ $? -ne 0 ]]; check "composition: token_source=file + provenance=verified_match -> no ? marker" $?
-
-cat > "${RUNTIME_DIR}/.claude_usage_limits_personal.json" <<EOF
-{"five_hour":{"utilization":10},"seven_day":{"utilization":5},"fetched_at":$(date +%s),"token_source":"file","provenance":"mismatch"}
-EOF
-gul_out4=$(echo '{"workspace":{"current_dir":"/tmp"},"context_window":{"used_percentage":7}}' | CLAUDE_CONFIG_DIR="$GUL_CONFIG_DIR" bash "$STATUSLINE" 2>/dev/null)
-echo "$gul_out4" | grep -q '?'
-check "composition: token_source=file + provenance=mismatch -> ? marker present" $?
-
-# Pre-existing cache with no provenance field at all -> defaults to
-# unverified -> ? stays (missing-field default in get_usage_limits).
-cat > "${RUNTIME_DIR}/.claude_usage_limits_personal.json" <<EOF
-{"five_hour":{"utilization":10},"seven_day":{"utilization":5},"fetched_at":$(date +%s),"token_source":"file"}
-EOF
-gul_out5=$(echo '{"workspace":{"current_dir":"/tmp"},"context_window":{"used_percentage":7}}' | CLAUDE_CONFIG_DIR="$GUL_CONFIG_DIR" bash "$STATUSLINE" 2>/dev/null)
-echo "$gul_out5" | grep -q '?'
-check "composition: pre-existing cache with no provenance field -> defaults unverified, ? marker present" $?
-
-# token_source=keychain + provenance=verified_match -> ? still stays;
-# the file+verified_match suppression path is keyed on token_source
-# being exactly "file", never keychain.
-cat > "${RUNTIME_DIR}/.claude_usage_limits_personal.json" <<EOF
-{"five_hour":{"utilization":10},"seven_day":{"utilization":5},"fetched_at":$(date +%s),"token_source":"keychain","provenance":"verified_match"}
-EOF
-gul_out6=$(echo '{"workspace":{"current_dir":"/tmp"},"context_window":{"used_percentage":7}}' | CLAUDE_CONFIG_DIR="$GUL_CONFIG_DIR" bash "$STATUSLINE" 2>/dev/null)
-echo "$gul_out6" | grep -q '?'
-check "composition: token_source=keychain -> ? marker present regardless of provenance" $?
-
-# restore equal-state fixture (matches the profile_uuid_state area's
-# final state) in case anything downstream assumes it
-echo '{"oauthAccount":{"accountUuid":"same-uuid"}}' > "$HOME/.claude/.claude.json"
-echo '{"oauthAccount":{"accountUuid":"same-uuid"}}' > "$HOME/.claude-personal/.claude.json"
-
-rm -f "${RUNTIME_DIR}/.claude_usage_limits_personal.json"
-rm -rf "$GUL_DIR"
+rm -f "$GUL_CACHE"
 
 # ─────────────────────────────────────────────────────────────
-# Area: profile-aware hook path (resolve_usage_refresh_hook)
+# Area: PR — stdin-first, gh fallback
 # ─────────────────────────────────────────────────────────────
-RRH_SRC=$(extract_func "$STATUSLINE" resolve_usage_refresh_hook)
-eval "$RRH_SRC"
+PRSTDIN_DIR=$(mktemp -d)
+git -C "$PRSTDIN_DIR" init -q
+git -C "$PRSTDIN_DIR" commit -q --allow-empty -m init
 
-mkdir -p "$HOME/.claude-personal/hooks" "$HOME/.claude/hooks"
-cat > "$HOME/.claude/hooks/show-usage-limits.sh" <<'EOF'
+GHSTUB2=$(mktemp -d)
+GH_CALLED="$GHSTUB2/gh_called"
+cat > "$GHSTUB2/gh" <<EOF
 #!/bin/bash
+touch "$GH_CALLED"
+echo '555'
 EOF
-chmod +x "$HOME/.claude/hooks/show-usage-limits.sh"
+chmod +x "$GHSTUB2/gh"
 
-export CLAUDE_CONFIG_DIR="$HOME/.claude-personal"
-cat > "$HOME/.claude-personal/hooks/show-usage-limits.sh" <<'EOF'
-#!/bin/bash
-EOF
-chmod +x "$HOME/.claude-personal/hooks/show-usage-limits.sh"
-result=$(resolve_usage_refresh_hook)
-assert_eq "executable personal hook preferred" "$HOME/.claude-personal/hooks/show-usage-limits.sh" "$result"
+prstdin_repo=$(basename "$PRSTDIN_DIR")
+rm -f ${RUNTIME_DIR}/.claude_pr_cache_${prstdin_repo}_* ${RUNTIME_DIR}/.claude_pr_branch_${prstdin_repo}_* ${RUNTIME_DIR}/.claude_pr_lock_${prstdin_repo}_*
 
-rm -f "$HOME/.claude-personal/hooks/show-usage-limits.sh"
-result=$(resolve_usage_refresh_hook)
-assert_eq "falls back to work hook when personal missing" "$HOME/.claude/hooks/show-usage-limits.sh" "$result"
+# test_stdin_pr_used_gh_not_invoked
+stdin_pr_json=$(jq -n --arg dir "$PRSTDIN_DIR" '{workspace:{current_dir:$dir},context_window:{used_percentage:5},pr:{number:1,url:"https://github.com/x/y/pull/1"}}')
+rm -f "$GH_CALLED"
+pr_out=$(printf '%s' "$stdin_pr_json" | PATH="$GHSTUB2:$PATH" CLAUDE_CONFIG_DIR="$HOME/.claude" bash "$STATUSLINE" 2>/dev/null)
+echo "$pr_out" | grep -q '#1'
+check "test_stdin_pr_used_gh_not_invoked: stdin PR number rendered" $?
+[[ ! -f "$GH_CALLED" ]]; check "test_stdin_pr_used_gh_not_invoked: gh stub NOT invoked" $?
 
-unset CLAUDE_CONFIG_DIR
-result=$(resolve_usage_refresh_hook)
-assert_eq "work hook chosen with CLAUDE_CONFIG_DIR unset" "$HOME/.claude/hooks/show-usage-limits.sh" "$result"
+# test_stdin_pr_absent_gh_fallback_invoked
+stdin_nopr_json=$(jq -n --arg dir "$PRSTDIN_DIR" '{workspace:{current_dir:$dir},context_window:{used_percentage:5}}')
+rm -f "$GH_CALLED" ${RUNTIME_DIR}/.claude_pr_cache_${prstdin_repo}_* ${RUNTIME_DIR}/.claude_pr_branch_${prstdin_repo}_* ${RUNTIME_DIR}/.claude_pr_lock_${prstdin_repo}_*
+pr_out2=$(printf '%s' "$stdin_nopr_json" | PATH="$GHSTUB2:$PATH" CLAUDE_CONFIG_DIR="$HOME/.claude" bash "$STATUSLINE" 2>/dev/null)
+[[ -f "$GH_CALLED" ]]; check "test_stdin_pr_absent_gh_fallback_invoked: gh stub WAS invoked" $?
+echo "$pr_out2" | grep -q '#555'
+check "test_stdin_pr_absent_gh_fallback_invoked: gh fallback PR rendered" $?
+
+rm -f ${RUNTIME_DIR}/.claude_pr_cache_${prstdin_repo}_* ${RUNTIME_DIR}/.claude_pr_branch_${prstdin_repo}_* ${RUNTIME_DIR}/.claude_pr_lock_${prstdin_repo}_*
+rm -rf "$GHSTUB2" "$PRSTDIN_DIR"
+
+# ─────────────────────────────────────────────────────────────
+# Area: no dead refresh/marker machinery left in statusline-command.sh
+# (grep-verify — the full-tree variant that also covers install.sh and
+# the deleted hook/capture files lives at the end of this suite).
+# ─────────────────────────────────────────────────────────────
+grep -Eq 'unverifiable_marker|token_source|parse_iso_utc|USAGE_CACHE_TTL_SECONDS|maybe_refresh_usage_cache|resolve_usage_refresh_hook|USAGE_REFRESH_HOOK|provenance' "$STATUSLINE"
+[[ $? -ne 0 ]]; check "test_no_unverifiable_marker_exists: statusline has no dead refresh/marker machinery" $?
 
 # ─────────────────────────────────────────────────────────────
 # Area: RUNTIME_DIR (per-user 0700 dir replacing bare /tmp for every
