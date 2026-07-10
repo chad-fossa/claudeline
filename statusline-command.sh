@@ -136,6 +136,22 @@ write_usage_cache() {
   # from stdin this run is unaffected — only the write is gated.
   ((ACCOUNT_ASSUMED)) && return
   local five_pct=$1 five_reset=$2 seven_pct=$3 seven_reset=$4
+
+  # Skip the write entirely when nothing actually changed — this
+  # rewrote on every render before (every render re-derives the same
+  # stdin values); comparing against what's already on disk restores a
+  # throttle without a time-based TTL.
+  if [[ -f "$USAGE_CACHE" ]]; then
+    local existing
+    existing=$(jq -r '[(.five_hour.used_percentage // ""), (.five_hour.resets_at // ""), (.seven_day.used_percentage // ""), (.seven_day.resets_at // "")] | map(tostring) | join("")' "$USAGE_CACHE" 2>/dev/null)
+    [[ "$existing" == "${five_pct}"$'\x01'"${five_reset}"$'\x01'"${seven_pct}"$'\x01'"${seven_reset}" ]] && return
+  fi
+
+  # Atomic write: tmp file + mv, not a direct redirect into $USAGE_CACHE
+  # — a reader mid-write must never see a partial/truncated cache
+  # (safe today only by luck, since a malformed partial write happens to
+  # collapse into the anti-fabrication guard — not by design).
+  local tmp="${USAGE_CACHE}.tmp.$$"
   jq -n \
     --argjson five_pct "${five_pct:-null}" \
     --argjson five_reset "${five_reset:-null}" \
@@ -144,7 +160,7 @@ write_usage_cache() {
     --argjson fetched_at "$(date +%s)" \
     '{five_hour: {used_percentage: $five_pct, resets_at: $five_reset},
       seven_day: {used_percentage: $seven_pct, resets_at: $seven_reset},
-      fetched_at: $fetched_at}' > "$USAGE_CACHE" 2>/dev/null
+      fetched_at: $fetched_at}' > "$tmp" 2>/dev/null && mv -f "$tmp" "$USAGE_CACHE"
 }
 
 # Renders one window's "label:pct%" segment. reset_epoch drives the
@@ -169,90 +185,67 @@ render_usage_segment() {
   printf '%s%s:%s%s%d%%%s' "$DIM" "$label" "$RESET" "$color" "$pct" "$RESET"
 }
 
-get_usage_limits() {
+# Resolves one window: stdin's value when present, the (fresh) cache's
+# otherwise. Prints "pct\x01reset\x01came_from_stdin".
+resolve_window() {
+  local stdin_pct=$1 stdin_reset=$2 cache_pct=$3 cache_reset=$4
+  if [[ -n "$stdin_pct" && "$stdin_pct" != "null" ]]; then
+    printf '%s%s1' "$stdin_pct" "$stdin_reset"
+  else
+    printf '%s%s0' "$cache_pct" "$cache_reset"
+  fi
+}
+
+# Resolves this render's usage values: stdin when present, falling back
+# per window to the (900s-fresh) cache otherwise, refreshing the cache
+# whenever stdin carried anything. Validates used_percentage before it's
+# used further — invalid is treated as ABSENT, never fabricated as 0.
+# Prints "five_pct\x01five_reset\x01seven_pct\x01seven_reset".
+resolve_usage_values() {
   # A cache under a RUNTIME_DIR we don't own could be attacker-planted —
   # render no usage segment rather than trust its contents this run.
   [[ "$RUNTIME_DIR_SAFE" != "1" ]] && return
 
   local stdin_five_pct stdin_five_reset stdin_seven_pct stdin_seven_reset
   IFS=$'\x01' read -r stdin_five_pct stdin_five_reset stdin_seven_pct stdin_seven_reset < <(
-    printf '%s' "$INPUT" | jq -r '[
-      (.rate_limits.five_hour.used_percentage // ""),
-      (.rate_limits.five_hour.resets_at // ""),
-      (.rate_limits.seven_day.used_percentage // ""),
-      (.rate_limits.seven_day.resets_at // "")
-    ] | map(tostring) | join("")' 2>/dev/null
+    printf '%s' "$INPUT" | jq -r '[(.rate_limits.five_hour.used_percentage // ""), (.rate_limits.five_hour.resets_at // ""), (.rate_limits.seven_day.used_percentage // ""), (.rate_limits.seven_day.resets_at // "")] | map(tostring) | join("")' 2>/dev/null
   )
 
-  # Cache read, once — every window's fallback source when stdin
-  # doesn't carry it, and the writer's basis for whichever window this
-  # render's stdin doesn't carry (so a partial stdin payload can't
-  # clobber the other window's still-fresh cached data).
+  # Cache read, once. Gated on fetched_at explicitly: an old v0.6.x cache
+  # used different field names (utilization, ISO resets_at), so this
+  # fold comes back empty and reads as absent — never a fabricated
+  # 0%. A cache older than 900s is dropped the same way.
   local cache_fetched_at="" cache_five_pct="" cache_five_reset="" cache_seven_pct="" cache_seven_reset=""
   if [[ -f "$USAGE_CACHE" ]]; then
-    # Gate on fetched_at explicitly rather than trusting jq's `// ""`
-    # defaults: an old v0.6.x cache used different field names entirely
-    # (utilization instead of used_percentage, ISO resets_at instead of
-    # epoch), so this fold comes back empty and is treated as absent —
-    # never a fabricated 0%.
     IFS=$'\x01' read -r cache_fetched_at cache_five_pct cache_five_reset cache_seven_pct cache_seven_reset < <(
-      jq -r '[
-        (.fetched_at // ""),
-        (.five_hour.used_percentage // ""),
-        (.five_hour.resets_at // ""),
-        (.seven_day.used_percentage // ""),
-        (.seven_day.resets_at // "")
-      ] | map(tostring) | join("")' "$USAGE_CACHE" 2>/dev/null
+      jq -r '[(.fetched_at // ""), (.five_hour.used_percentage // ""), (.five_hour.resets_at // ""), (.seven_day.used_percentage // ""), (.seven_day.resets_at // "")] | map(tostring) | join("")' "$USAGE_CACHE" 2>/dev/null
     )
-
-    # Recency bound: a cache older than this never renders, even though
-    # fetched_at itself is valid — 900s comfortably covers the
-    # pre-first-response window across a session restart while still
-    # guaranteeing yesterday's numbers can never render as current.
     local cache_fresh=1
     [[ -z "$cache_fetched_at" || "$cache_fetched_at" == "null" || ! "$cache_fetched_at" =~ ^[0-9]+$ ]] && cache_fresh=0
-    if ((cache_fresh)); then
-      local cache_age_secs=$(( $(date +%s) - cache_fetched_at ))
-      ((cache_age_secs > 900)) && cache_fresh=0
-    fi
-    if ((! cache_fresh)); then
-      cache_five_pct="" cache_five_reset="" cache_seven_pct="" cache_seven_reset=""
-    fi
+    ((cache_fresh)) && (( $(date +%s) - cache_fetched_at > 900 )) && cache_fresh=0
+    ((cache_fresh)) || { cache_five_pct=""; cache_five_reset=""; cache_seven_pct=""; cache_seven_reset=""; }
   fi
 
-  # Per-window stdin gate: each window uses stdin when stdin carries it,
-  # falling back independently to the (fresh) cache otherwise — a
-  # payload carrying only one window must never blank out or drop the
-  # other window's still-good data (the C2 bug: gating the ENTIRE branch
-  # on five_hour alone silently dropped a seven_day-only payload).
-  local five_pct="" five_reset="" seven_pct="" seven_reset="" have_stdin=0
+  # Per-window resolution (the C2 fix): a payload carrying only one
+  # window must never blank out the other's still-good cached data.
+  local five_pct five_reset five_from_stdin seven_pct seven_reset seven_from_stdin
+  IFS=$'\x01' read -r five_pct five_reset five_from_stdin < <(resolve_window "$stdin_five_pct" "$stdin_five_reset" "$cache_five_pct" "$cache_five_reset")
+  IFS=$'\x01' read -r seven_pct seven_reset seven_from_stdin < <(resolve_window "$stdin_seven_pct" "$stdin_seven_reset" "$cache_seven_pct" "$cache_seven_reset")
 
-  if [[ -n "$stdin_five_pct" && "$stdin_five_pct" != "null" ]]; then
-    five_pct=$stdin_five_pct
-    five_reset=$stdin_five_reset
-    have_stdin=1
-  else
-    five_pct=$cache_five_pct
-    five_reset=$cache_five_reset
-  fi
-
-  if [[ -n "$stdin_seven_pct" && "$stdin_seven_pct" != "null" ]]; then
-    seven_pct=$stdin_seven_pct
-    seven_reset=$stdin_seven_reset
-    have_stdin=1
-  else
-    seven_pct=$cache_seven_pct
-    seven_reset=$cache_seven_reset
-  fi
-
-  # Validate before this reaches awk/bash arithmetic (render_usage_segment,
-  # the rollover comparisons below) — an invalid value is treated as
-  # ABSENT, never fabricated as 0. Applies regardless of source (stdin or
-  # cache), and runs before the cache write so a bad value never persists.
+  # Validate before this reaches awk/bash arithmetic — invalid is
+  # ABSENT, never fabricated as 0. Runs before the cache write so a bad
+  # value never persists.
   [[ "$five_pct" =~ ^[0-9]+(\.[0-9]+)?$ ]] || five_pct=""
   [[ "$seven_pct" =~ ^[0-9]+(\.[0-9]+)?$ ]] || seven_pct=""
 
-  ((have_stdin)) && write_usage_cache "$five_pct" "$five_reset" "$seven_pct" "$seven_reset"
+  { ((five_from_stdin)) || ((seven_from_stdin)); } && write_usage_cache "$five_pct" "$five_reset" "$seven_pct" "$seven_reset"
+
+  printf '%s%s%s%s' "$five_pct" "$five_reset" "$seven_pct" "$seven_reset"
+}
+
+get_usage_limits() {
+  local five_pct five_reset seven_pct seven_reset
+  IFS=$'\x01' read -r five_pct five_reset seven_pct seven_reset < <(resolve_usage_values)
 
   { [[ -z "$five_pct" || "$five_pct" == "null" ]] && [[ -z "$seven_pct" || "$seven_pct" == "null" ]]; } && return
 
@@ -448,6 +441,47 @@ get_pr_number() {
   echo "$branch" > "$branch_cache"
 }
 
+# The one place PR text becomes a clickable link: a URL wraps it via
+# hyperlink(), an absent URL falls back to plain text. Both resolve_pr
+# paths (stdin, gh) call this instead of each duplicating the branch.
+pr_link_for() {
+  local url=$1 text=$2
+  if [[ -n "$url" && "$url" != "null" ]]; then
+    hyperlink "$url" "$text"
+  else
+    printf '%s' "$text"
+  fi
+}
+
+# Resolves the PR number + link for this render: stdin first (Claude
+# Code already resolved it for the session) via a guard-clause early
+# return, falling through to get_pr_number's gh lookup only when stdin
+# doesn't carry one. Prints "pr\x01pr_link" (empty/empty when no PR).
+resolve_pr() {
+  local repo=$1 branch=$2
+
+  local stdin_pr_number stdin_pr_url
+  IFS=$'\x01' read -r stdin_pr_number stdin_pr_url < <(
+    echo "$INPUT" | jq -r '[(.pr.number // ""), (.pr.url // "")] | map(tostring) | join("")'
+  )
+  stdin_pr_number=$(strip_ctrl "$stdin_pr_number")
+
+  if [[ -n "$stdin_pr_number" && "$stdin_pr_number" != "null" ]]; then
+    local pr="#${stdin_pr_number}"
+    printf '%s\x01%s' "$pr" "$(pr_link_for "$stdin_pr_url" "$pr")"
+    return
+  fi
+
+  local pr
+  pr=$(get_pr_number "$repo" "$branch")
+  [[ -z "$pr" ]] && return
+
+  local repo_url url=""
+  repo_url=$(get_repo_url)
+  [[ -n "$repo_url" ]] && url="${repo_url}/pull/${pr#\#}"
+  printf '%s\x01%s' "$pr" "$(pr_link_for "$url" "$pr")"
+}
+
 get_work_status() {
   local staged=0 unstaged=0
   git -C "$CWD" diff --cached --quiet 2>/dev/null || staged=1
@@ -535,7 +569,7 @@ shared_login_marker() {
 # Build output
 # ─────────────────────────────────────────────────────────────
 build_output() {
-  local percent repo branch pr pr_num repo_url pr_link work_status sync_status
+  local percent repo branch pr pr_link work_status sync_status
   percent=$(get_context)
 
   # Show account label if multiple accounts exist
@@ -551,34 +585,7 @@ build_output() {
   if is_git_repo; then
     repo=$(get_repo_name)
     branch=$(get_branch)
-
-    # PR: stdin-first (Claude Code already resolved it for this session),
-    # falling back to get_pr_number's gh lookup only when stdin doesn't
-    # carry it.
-    local stdin_pr_number stdin_pr_url
-    stdin_pr_number=$(strip_ctrl "$(echo "$INPUT" | jq -r '.pr.number // empty')")
-    stdin_pr_url=$(echo "$INPUT" | jq -r '.pr.url // empty')
-
-    pr_link=""
-    if [[ -n "$stdin_pr_number" && "$stdin_pr_number" != "null" ]]; then
-      pr="#${stdin_pr_number}"
-      if [[ -n "$stdin_pr_url" && "$stdin_pr_url" != "null" ]]; then
-        pr_link=$(hyperlink "$stdin_pr_url" "$pr")
-      else
-        pr_link="$pr"
-      fi
-    else
-      pr=$(get_pr_number "$repo" "$branch")
-      if [[ -n "$pr" ]]; then
-        repo_url=$(get_repo_url)
-        pr_num="${pr#\#}"
-        if [[ -n "$repo_url" ]]; then
-          pr_link=$(hyperlink "${repo_url}/pull/${pr_num}" "$pr")
-        else
-          pr_link="$pr"
-        fi
-      fi
-    fi
+    IFS=$'\x01' read -r pr pr_link < <(resolve_pr "$repo" "$branch")
 
     work_status=$(get_work_status)
     sync_status=$(get_sync_status)

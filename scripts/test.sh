@@ -315,10 +315,14 @@ rm -f "$GUL_CACHE"
 # retried if a wall-clock second boundary is crossed mid-check, so the
 # assertion itself never races.
 GUL_FUNC_SRC=$(extract_func "$STATUSLINE" get_usage_limits)
+RESOLVE_VALUES_SRC=$(extract_func "$STATUSLINE" resolve_usage_values)
+RESOLVE_WINDOW_SRC=$(extract_func "$STATUSLINE" resolve_window)
 RENDER_SEG_SRC=$(extract_func "$STATUSLINE" render_usage_segment)
 WRITE_CACHE_SRC=$(extract_func "$STATUSLINE" write_usage_cache)
 eval "$RENDER_SEG_SRC"
 eval "$WRITE_CACHE_SRC"
+eval "$RESOLVE_WINDOW_SRC"
+eval "$RESOLVE_VALUES_SRC"
 eval "$GUL_FUNC_SRC"
 ACCOUNT_ID=work
 ACCOUNT_ASSUMED=0
@@ -696,6 +700,118 @@ grep -q "capture-profile-session.sh" "$CURL_URLS_LOG"
 [[ $? -ne 0 ]]; check "test_install_downloads_only_statusline_and_skill: capture script never curled" $?
 
 rm -rf "$CURLSTUB" "$INSTALL_TARGET"
+
+# ─────────────────────────────────────────────────────────────
+# Area: C3 — structural constraints (mechanical refactor). Pulled out
+# as its own helper pair rather than one-off inline checks since both
+# build_output and get_usage_limits/resolve_usage_values are held to
+# the same two constraints.
+# ─────────────────────────────────────────────────────────────
+func_line_count() {
+  extract_func "$STATUSLINE" "$1" | wc -l | tr -d ' '
+}
+
+# Max indent among the function's OWN body lines (excluding its opening
+# and closing brace lines). This file indents 2 spaces/level, so indent
+# 2 = the function's direct statements (0 levels of nesting), indent 6 =
+# 2 levels of nesting — the ceiling this project's CLAUDE.md sets.
+func_max_indent() {
+  extract_func "$STATUSLINE" "$1" | sed '1d;$d' | awk '
+    /^[[:space:]]*$/ { next }
+    { match($0, /^[ ]*/); print RLENGTH }
+  ' | sort -n | tail -1
+}
+
+bo_lines=$(func_line_count build_output)
+[[ "$bo_lines" -le 50 ]]
+check "test_build_output_le_50_lines: build_output is <=50 lines (got $bo_lines)" $?
+
+bo_indent=$(func_max_indent build_output)
+[[ "$bo_indent" -le 6 ]]
+check "test_build_output_le_2_nesting_levels: build_output nests <=2 levels (max indent ${bo_indent:-?} spaces)" $?
+
+gul_lines=$(func_line_count get_usage_limits)
+[[ "$gul_lines" -le 50 ]]
+check "test_get_usage_limits_le_50_lines: get_usage_limits is <=50 lines (got $gul_lines)" $?
+
+gul_fn_indent=$(func_max_indent get_usage_limits)
+[[ "$gul_fn_indent" -le 6 ]]
+check "test_get_usage_limits_le_2_nesting_levels: get_usage_limits nests <=2 levels (max indent ${gul_fn_indent:-?} spaces)" $?
+
+ruv_lines=$(func_line_count resolve_usage_values)
+[[ -n "$ruv_lines" && "$ruv_lines" -gt 0 && "$ruv_lines" -le 50 ]]
+check "test_resolve_usage_values_exists_le_50_lines: resolve_usage_values extracted, <=50 lines (got ${ruv_lines:-0})" $?
+
+ruv_indent=$(func_max_indent resolve_usage_values)
+[[ "$ruv_indent" -le 6 ]]
+check "test_resolve_usage_values_le_2_nesting_levels: resolve_usage_values nests <=2 levels (max indent ${ruv_indent:-?} spaces)" $?
+
+rp_lines=$(func_line_count resolve_pr)
+[[ -n "$rp_lines" && "$rp_lines" -gt 0 && "$rp_lines" -le 50 ]]
+check "test_resolve_pr_extracted_le_50_lines: resolve_pr extracted from build_output, <=50 lines (got ${rp_lines:-0})" $?
+
+rp_indent=$(func_max_indent resolve_pr)
+[[ "$rp_indent" -le 6 ]]
+check "test_resolve_pr_le_2_nesting_levels: resolve_pr nests <=2 levels (max indent ${rp_indent:-?} spaces)" $?
+
+# PR-hyperlink construction written ONCE: exactly one call site builds a
+# link, instead of the stdin and gh paths each duplicating the
+# "hyperlink if a URL exists, else plain text" branch.
+hyperlink_call_sites=$(grep -c 'hyperlink "' "$STATUSLINE")
+assert_eq "test_pr_hyperlink_construction_written_once: exactly one hyperlink() call site" "1" "$hyperlink_call_sites"
+
+# .pr.number + .pr.url folded into ONE jq call (the \x01-join idiom this
+# file already uses elsewhere), not two separate jq spawns.
+pr_jq_spawns=$(grep -c "jq -r '.pr\." "$STATUSLINE")
+assert_eq "test_pr_fields_folded_into_one_jq_call: no separate .pr.number/.pr.url jq spawns remain" "0" "$pr_jq_spawns"
+
+# ─────────────────────────────────────────────────────────────
+# Area: C3 — write_usage_cache skips unchanged writes, writes atomically.
+# ─────────────────────────────────────────────────────────────
+WUC_SRC=$(extract_func "$STATUSLINE" write_usage_cache)
+eval "$WUC_SRC"
+WUC_CACHE="${RUNTIME_DIR}/.claude_usage_limits_work.json"
+rm -f "$WUC_CACHE"
+ACCOUNT_ID=work
+ACCOUNT_ASSUMED=0
+USAGE_CACHE="$WUC_CACHE"
+
+# Seed an initial write, then call again with IDENTICAL values — the
+# file (and its fetched_at) must be left untouched (currently rewrites
+# on every render; was <=1/300s before this project's v0.6.x throttle).
+write_usage_cache 42 9999999999 30 9999999999
+wuc_fetched_1=$(jq -r '.fetched_at' "$WUC_CACHE" 2>/dev/null)
+sleep 1
+write_usage_cache 42 9999999999 30 9999999999
+wuc_fetched_2=$(jq -r '.fetched_at' "$WUC_CACHE" 2>/dev/null)
+assert_eq "test_write_usage_cache_skips_unchanged: fetched_at untouched when values are identical" "$wuc_fetched_1" "$wuc_fetched_2"
+
+# A genuinely different value must still write through.
+sleep 1
+write_usage_cache 55 9999999999 30 9999999999
+wuc_fetched_3=$(jq -r '.fetched_at' "$WUC_CACHE" 2>/dev/null)
+wuc_five_3=$(jq -r '.five_hour.used_percentage' "$WUC_CACHE" 2>/dev/null)
+[[ "$wuc_fetched_3" != "$wuc_fetched_2" ]]
+check "test_write_usage_cache_writes_through_on_change: fetched_at updates when a value actually changes" $?
+assert_eq "test_write_usage_cache_writes_through_on_change: new value persisted" "55" "$wuc_five_3"
+rm -f "$WUC_CACHE"
+
+# Atomic write: a tmp file + mv, not a direct `> $USAGE_CACHE` redirect
+# (safe today only by luck — a malformed partial write happens to
+# collapse into the anti-fabrication guard — not by design).
+grep -q 'mv ' "$STATUSLINE"
+check "test_write_usage_cache_atomic: write_usage_cache uses tmp file + mv" $?
+grep -A20 '^write_usage_cache() {' "$STATUSLINE" | grep -qE "jq -n.*> \"?\\\$USAGE_CACHE\"?[[:space:]]*2>/dev/null[[:space:]]*$"
+[[ $? -ne 0 ]]; check "test_write_usage_cache_atomic: no direct non-atomic redirect into \$USAGE_CACHE" $?
+
+write_usage_cache 20 9999999999 10 9999999999
+[[ -f "$WUC_CACHE" ]]; check "test_write_usage_cache_atomic: cache file exists after write" $?
+jq -e . "$WUC_CACHE" >/dev/null 2>&1
+check "test_write_usage_cache_atomic: cache file is valid, complete JSON (no partial write left behind)" $?
+wuc_tmp_leftover=$(find "$RUNTIME_DIR" -maxdepth 1 -name '.claude_usage_limits_work.json.tmp*' 2>/dev/null)
+[[ -z "$wuc_tmp_leftover" ]]
+check "test_write_usage_cache_atomic: no leftover tmp file after write" $?
+rm -f "$WUC_CACHE"
 
 # ─────────────────────────────────────────────────────────────
 # Area: no dead subsystem references anywhere in the tree (full-tree
