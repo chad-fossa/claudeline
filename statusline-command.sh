@@ -397,11 +397,16 @@ shared_login_marker() {
   [[ "$state" == "equal" ]] && printf '%s=%s' "$DIM" "$RESET"
 }
 
-# True only when this profile's .credentials.json was captured (via
-# scripts/capture-profile-session.sh) FOR this exact profile — i.e. its
-# claudeline.captured_for_uuid matches this profile's .claude.json
-# accountUuid. A file with no claudeline block (hand-captured pre-0.6.0)
-# or a mismatched uuid returns false.
+# True only when this profile's .credentials.json carries a VERIFIED
+# identity for this exact profile — i.e. its claudeline.verified_account_uuid
+# matches this profile's .claude.json accountUuid. verified_account_uuid is
+# only ever written after an identity probe confirms the captured token's
+# real owner (scripts/capture-profile-session.sh Task 7). captured_for_uuid
+# is forensics-only: the capture script stamps its OWN profile's uuid by
+# construction, so a mis-capture trivially satisfies captured_for_uuid ==
+# profile_uuid — it must NEVER gate this. A file with no claudeline block,
+# no verified_account_uuid (unverified capture), or a mismatched uuid
+# returns false.
 file_provenance_matches() {
   local creds_dir
   if [[ "$ACCOUNT_ID" == "personal" ]]; then
@@ -414,19 +419,20 @@ file_provenance_matches() {
   local claude_json="$creds_dir/.claude.json"
   [[ -f "$creds_file" && -f "$claude_json" ]] || return 1
 
-  local captured_uuid profile_uuid
-  captured_uuid=$(jq -r '.claudeline.captured_for_uuid // empty' "$creds_file" 2>/dev/null)
+  local verified_uuid profile_uuid
+  verified_uuid=$(jq -r '.claudeline.verified_account_uuid // empty' "$creds_file" 2>/dev/null)
   profile_uuid=$(jq -r '.oauthAccount.accountUuid // empty' "$claude_json" 2>/dev/null)
 
-  [[ -n "$captured_uuid" && -n "$profile_uuid" && "$captured_uuid" == "$profile_uuid" ]]
+  [[ -n "$verified_uuid" && -n "$profile_uuid" && "$verified_uuid" == "$profile_uuid" ]]
 }
 
 # state: profile_uuid_state() result. token_source/provenance_ok default to
 # pre-0.6.0 values so old 1-arg callers keep today's darwin+differ behavior.
 # file-refresh-failed always wins (stale numbers + broken refresh, distinct
-# from the cross-profile-ambiguity ?). file+matching provenance suppresses
-# ? — anything else (mismatch, unknown, keychain) renders it exactly as
-# v0.5.0 did.
+# from the cross-profile-ambiguity ?). file+VERIFIED identity (provenance_ok
+# from file_provenance_matches, which keys on verified_account_uuid, never
+# captured_for_uuid alone) suppresses ? — anything else (mismatch, unknown,
+# keychain, unverified capture) renders it exactly as v0.5.0 did.
 unverifiable_marker() {
   local state=$1 token_source=${2:-unknown} provenance_ok=${3:-1}
 

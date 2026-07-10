@@ -459,8 +459,16 @@ assert_eq "token_source=keychain -> ? per v0.5.0" " ${DIM}?${RESET}" "$marker"
 marker=$(unverifiable_marker "equal" "file-refresh-failed" "1")
 assert_eq "token_source=file-refresh-failed -> ! marker" " ${DIM}${RED}!${RESET}" "$marker"
 
+# captured_for_uuid alone (provenance_ok=1, i.e. file_provenance_matches
+# returned false because verified_account_uuid is absent) must never
+# suppress ? even when token_source=file — this is the hard expert
+# condition Task 6 fixes.
+marker=$(unverifiable_marker "differ" "file" "1")
+assert_eq "token_source=file + captured_for_uuid-only (unverified) -> ? stays, suppression never fires on captured_for_uuid alone" " ${DIM}?${RESET}" "$marker"
+
 # ─────────────────────────────────────────────────────────────
-# Area: file_provenance_matches (captured_for_uuid vs profile uuid)
+# Area: file_provenance_matches (verified_account_uuid vs profile uuid —
+# captured_for_uuid is forensics-only and must NEVER gate this)
 # ─────────────────────────────────────────────────────────────
 FPM_SRC=$(extract_func "$STATUSLINE" file_provenance_matches)
 eval "$FPM_SRC"
@@ -473,14 +481,19 @@ ACCOUNT_ID="personal"
 CLAUDE_CONFIG_DIR="$FPM_PERSONAL"
 
 echo '{"oauthAccount":{"accountUuid":"uuid-match"}}' > "$FPM_PERSONAL/.claude.json"
-echo '{"claudeAiOauth":{"accessToken":"tok_fake_fpm"},"claudeline":{"captured_for_uuid":"uuid-match"}}' > "$FPM_PERSONAL/.credentials.json"
+echo '{"claudeAiOauth":{"accessToken":"tok_fake_fpm"},"claudeline":{"captured_for_uuid":"uuid-match","verified_account_uuid":"uuid-match"}}' > "$FPM_PERSONAL/.credentials.json"
 file_provenance_matches
-check "file_provenance_matches: matching uuid -> true" $?
+check "file_provenance_matches: matching verified_account_uuid -> true" $?
 
-echo '{"claudeAiOauth":{"accessToken":"tok_fake_fpm"},"claudeline":{"captured_for_uuid":"uuid-other"}}' > "$FPM_PERSONAL/.credentials.json"
+echo '{"claudeAiOauth":{"accessToken":"tok_fake_fpm"},"claudeline":{"captured_for_uuid":"uuid-match","verified_account_uuid":"uuid-other"}}' > "$FPM_PERSONAL/.credentials.json"
 file_provenance_matches
 result=$?
-[[ "$result" != "0" ]]; check "file_provenance_matches: mismatched uuid -> false" $?
+[[ "$result" != "0" ]]; check "file_provenance_matches: mismatched verified_account_uuid -> false" $?
+
+echo '{"claudeAiOauth":{"accessToken":"tok_fake_fpm"},"claudeline":{"captured_for_uuid":"uuid-match"}}' > "$FPM_PERSONAL/.credentials.json"
+file_provenance_matches
+result=$?
+[[ "$result" != "0" ]]; check "file_provenance_matches: captured_for_uuid alone (no verified_account_uuid) -> false, never suppresses" $?
 
 echo '{"claudeAiOauth":{"accessToken":"tok_fake_fpm"}}' > "$FPM_PERSONAL/.credentials.json"
 file_provenance_matches
