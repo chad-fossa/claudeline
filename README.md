@@ -101,7 +101,8 @@ CLAUDE_CONFIG_DIR=$HOME/.claude-personal ./install.sh
 
 ### How it works
 
-- Credentials are stored per-account: `$CLAUDE_CONFIG_DIR/.credentials.json` on Linux, or after running [the capture script](#per-profile-credentials-macos) on macOS; otherwise macOS falls back to the shared Keychain entry
+- **`/login` in either profile is all you have to do.** claudeline notices the fresh login and captures + verifies that profile's own session automatically — see [Per-profile credentials (macOS)](#per-profile-credentials-macos).
+- Credentials are stored per-account: `$CLAUDE_CONFIG_DIR/.credentials.json` on Linux, or via auto-capture (or [manual capture](#manual-capture-troubleshooting--recovery)) on macOS; otherwise macOS falls back to the shared Keychain entry
 - The statusline shows `[W]` or `[P]` when both `~/.claude` and `~/.claude-personal` exist
 - Usage limits are cached per-account so they don't clobber each other
 - `claude` (no alias) uses `~/.claude` by default — your work account
@@ -109,16 +110,23 @@ CLAUDE_CONFIG_DIR=$HOME/.claude-personal ./install.sh
 
 ### Per-profile credentials (macOS)
 
-macOS Keychain has only one slot for the Claude Max OAuth token (`Claude Code-credentials`), so both profiles' statuslines end up reading the same last-login session — see [Cross-profile identity markers](#cross-profile-identity-markers) below. To fix this instead of just flagging it, give each profile its own `.credentials.json`:
+macOS Keychain has only one slot for the Claude Max OAuth token (`Claude Code-credentials`), so both profiles' statuslines would otherwise end up reading the same last-login session — see [Cross-profile identity markers](#cross-profile-identity-markers) below. claudeline fixes this instead of just flagging it: **`/login` in either profile — claudeline picks it up automatically within one refresh** (session start, `/usage`, or the next background statusline refresh).
+
+Here's what happens behind the scenes: `hooks/show-usage-limits.sh` notices this profile's `.claude.json` got a fresh login (its `oauthAccount.profileFetchedAt` changed) and hands off to `scripts/capture-profile-session.sh`, which copies the Keychain session into that profile's own `$CLAUDE_CONFIG_DIR/.credentials.json` — but only after verifying with Anthropic's account-profile endpoint that the token it's about to capture actually belongs to this profile's account. A verified capture is stamped `claudeline.verified_account_uuid`; from then on the hook reads that file first and refreshes it itself when the token expires, so logins become rare — claudeline owns the OAuth refresh for that file rather than relying on Keychain.
+
+A capture only proceeds when the login and the Keychain write happen close together (within 30s by default, `CLAUDELINE_CAPTURE_WINDOW_SECS` to adjust); outside that window claudeline vetoes the capture rather than risk grabbing the wrong profile's fresh login, and drops `/tmp/.claude_cred_capture_vetoed_<account>`. The identity probe can also veto a capture outright if the token turns out to belong to a different account than expected — same artifact, no file written either way.
+
+If claudeline's owned refresh ever fails (upstream token/grant shape changes, network issues), it never falls back to the shared Keychain slot silently — it renders a `!` marker instead (see the table below) and drops a loud artifact at `/tmp/.claude_cred_refresh_failed_<account>`.
+
+### Manual capture (troubleshooting / recovery)
+
+Auto-capture's trigger depends on `.claude.json`'s `oauthAccount.profileFetchedAt`, which older Claude Code builds don't write — on those, a login never fires auto-capture. Run the capture script directly to force one (also useful to force a re-verification, or if a veto artifact shows up and you want to retry once the timing settles):
 
 ```bash
-# After /login in a profile, capture its session once:
 CLAUDE_CONFIG_DIR=$HOME/.claude-personal scripts/capture-profile-session.sh
 ```
 
-This copies the current Keychain session into that profile's `$CLAUDE_CONFIG_DIR/.credentials.json` with a provenance stamp (`claudeline.captured_for_uuid`). From then on, `hooks/show-usage-limits.sh` reads that file first and refreshes it itself when the token expires — logins become rare, since claudeline owns the OAuth refresh for that file rather than relying on Keychain. Re-run the capture script any time a profile's usage numbers should re-anchor to a fresh login (e.g. after re-authenticating).
-
-If claudeline's owned refresh ever fails (upstream token/grant shape changes, network issues), it never falls back to the shared Keychain slot silently — it renders a `!` marker instead (see the table below) and drops a loud artifact at `/tmp/.claude_cred_refresh_failed_<account>`.
+This runs the same identity-verified capture auto-capture uses, synchronously, with output on stdout (never prints the token itself).
 
 ### Cross-profile identity markers
 
@@ -127,9 +135,11 @@ claudeline can't fully close the shared-keychain-slot issue above on its own, bu
 | Marker | Meaning |
 |--------|---------|
 | Dim `=` after the account label (e.g. `[P]=`) | Both profiles are logged into the *same* account. |
-| Dim `?` after the usage segment (macOS only) | The profile's credentials aren't a verified per-profile capture (no file, no provenance match, or a hand-captured file) — the usage numbers shown may belong to the wrong profile, treat them as unverified. Fixed by running [the capture script](#per-profile-credentials-macos) for this profile. |
+| Dim `?` after the usage segment (macOS only) | This profile's credentials aren't a VERIFIED per-profile capture (no file, an unverified capture, or a verified-uuid mismatch) — the usage numbers shown may belong to the wrong profile, treat them as unverified. Retires only after one verified capture: `/login` for this profile while online (needs a Claude Code build that writes `profileFetchedAt`, or run [manual capture](#manual-capture-troubleshooting--recovery) directly). |
 | Dim/red `!` after the usage segment | This profile's `.credentials.json` exists but claudeline's owned refresh failed — numbers are stale and the token could not be renewed. Check `/tmp/.claude_cred_refresh_failed_<account>`. |
 | Account label itself dimmed (e.g. `[W]`) | The account was assumed (`CLAUDE_CONFIG_DIR` unset) rather than explicitly detected. |
+
+A capture that gets vetoed (identity mismatch, or login/Keychain timing outside the corroboration window) never writes a file — it drops `/tmp/.claude_cred_capture_vetoed_<account>` instead, and `?` stays exactly as before the login attempt.
 
 ### Customizing account labels
 
@@ -146,7 +156,7 @@ export CLAUDE_ACCOUNT_PERSONAL_COLOR=$'\033[35m' # magenta (default)
 
 | Shared | Per-Account |
 |--------|-------------|
-| CLAUDE.md, settings.json | Auth credentials (Keychain) |
+| CLAUDE.md, settings.json | Auth credentials (per-account file, auto-captured on macOS) |
 | Skills, plugins, hooks | settings.local.json |
 | Statusline config | Usage limit cache |
 | Conversation history | Session env/cache |
@@ -167,8 +177,8 @@ export CLAUDE_ACCOUNT_PERSONAL_COLOR=$'\033[35m' # magenta (default)
 ## Requirements
 
 - **macOS or Linux**
-  - macOS reads the OAuth token from Keychain (`Claude Code-credentials`)
-  - Linux reads it from `~/.claude/.credentials.json` (or `$CLAUDE_CONFIG_DIR/.credentials.json`)
+  - Both read the OAuth token from `~/.claude/.credentials.json` (or `$CLAUDE_CONFIG_DIR/.credentials.json`) first, refreshing it in place when it expires
+  - macOS falls back to Keychain (`Claude Code-credentials`) only when that file is absent — auto-capture (see [Per-profile credentials](#per-profile-credentials-macos)) keeps it populated after `/login`
 - **Claude Code** with OAuth login
 - **jq**
 - **gh** (optional, for PR detection)

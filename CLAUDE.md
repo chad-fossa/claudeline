@@ -71,6 +71,10 @@ It asserts the load-bearing invariant that `detect_account()` is duplicated verb
 
 The hook's file-first credentials and owned OAuth refresh (v0.6.0) are tested with PATH-shimmed `curl` and `security` stubs under the isolated `$HOME` — a `curl` stub keyed on URL (`/v1/oauth/token` vs `/api/oauth/usage`) returns configurable bodies/HTTP codes via env vars (`OAUTH_HTTP_CODE`, `OAUTH_RESPONSE_BODY`, `USAGE_RESPONSE_BODY`), and a `security` stub with a sentinel file lets tests assert Keychain was (or wasn't) invoked. Fake tokens only (`tok_fake_*`) — never real-looking token shapes, even in test fixtures.
 
+Identity verification and auto-capture (also v0.6.0) extend the same pattern:
+- The capture script's identity probe (`/api/oauth/profile`) gets its own `curl` stub keyed on `PROFILE_HTTP_CODE`/`PROFILE_RESPONSE_BODY`, separate from the refresh stub above since both can be in play in the same test file.
+- Auto-capture's corroboration window reads the Keychain item's modification time WITHOUT `-w` (metadata only, never the secret) — its `security` stub branches on whether `-w` is present and, when absent, prints a fake `attributes:` block with an `"mdat"<timestamp>="YYYYMMDDHHMMSSZ"` line the hook parses. Tests compute that timestamp from real epoch offsets (`epoch_to_mdat_ts()`) around the current time rather than hardcoding a date, so the corroboration-window math stays correct regardless of when the suite runs.
+
 ## Known upstream constraints
 
 - macOS Keychain stores only one Claude Max OAuth token (`Claude Code-credentials`); `/login` on a second account overwrites the first. Tracked at [anthropics/claude-code#20553](https://github.com/anthropics/claude-code/issues/20553). Work around by re-`/login`-ing on switch.
