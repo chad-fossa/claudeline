@@ -228,7 +228,15 @@ assert_eq "test_stdin_usage_rendered_and_cached: cache resets_at is a raw epoch 
 gul_fetched_at=$(jq -r '.fetched_at' "$GUL_CACHE" 2>/dev/null)
 [[ -n "$gul_fetched_at" && "$gul_fetched_at" != "null" ]]; check "test_stdin_usage_rendered_and_cached: cache has fetched_at" $?
 
-# test_stdin_absent_renders_from_fresh_cache
+# test_stdin_absent_renders_from_fresh_cache — seeds its own fixture
+# rather than relying on the cache state the PRECEDING test happens to
+# leave behind (that coupling made this test pass/fail for the wrong
+# reason if the tests above it were ever reordered or changed).
+rm -f "$GUL_CACHE"
+GUL_OWN_FIVE_EPOCH=$(( $(date +%s) + 3600 ))
+GUL_OWN_SEVEN_EPOCH=$(( $(date +%s) + 86400 ))
+jq -n --argjson f "$GUL_OWN_FIVE_EPOCH" --argjson s "$GUL_OWN_SEVEN_EPOCH" --argjson fa "$(date +%s)" \
+  '{five_hour:{used_percentage:10,resets_at:$f},seven_day:{used_percentage:16,resets_at:$s},fetched_at:$fa}' > "$GUL_CACHE"
 gul_out2=$(printf '%s' "$NO_RATE_LIMITS_JSON" | CLAUDE_CONFIG_DIR="$HOME/.claude" bash "$STATUSLINE" 2>/dev/null)
 echo "$gul_out2" | grep -q '10%'
 check "test_stdin_absent_renders_from_fresh_cache: 5h renders from cache" $?
@@ -267,6 +275,67 @@ echo "$gul_out5" | grep -q '50%'
 [[ $? -ne 0 ]]; check "test_old_schema_cache_treated_as_absent: old-schema cache never renders" $?
 echo "$gul_out5" | grep -Eq '(^|[^0-9])0%'
 [[ $? -ne 0 ]]; check "test_old_schema_cache_treated_as_absent: never fabricates 0%" $?
+
+# ─────────────────────────────────────────────────────────────
+# Area: F — test gaps (legitimate zero, rollover boundary, malformed
+# resets_at).
+# ─────────────────────────────────────────────────────────────
+
+# test_legitimate_zero_used_percentage_renders_not_blank — 0 must render
+# as "0%", never be treated the same as an absent/invalid value.
+rm -f "$GUL_CACHE"
+zero_json=$(jq -n '{
+  workspace: {current_dir: "/tmp"},
+  context_window: {used_percentage: 5},
+  rate_limits: {five_hour: {used_percentage: 0, resets_at: 9999999999}}
+}')
+zero_out=$(printf '%s' "$zero_json" | CLAUDE_CONFIG_DIR="$HOME/.claude" bash "$STATUSLINE" 2>/dev/null)
+echo "$zero_out" | grep -Eq '(^|[^0-9])0%'
+check "test_legitimate_zero_used_percentage_renders_not_blank: 0% renders, not blank" $?
+rm -f "$GUL_CACHE"
+
+# test_non_numeric_resets_at_treated_as_no_expiry — a malformed resets_at
+# must never reach `((...))` arithmetic (which would abort the script);
+# the existing regex guard blanks it, which the rollover check then reads
+# as "no expiry" and renders regardless of the current time.
+jq -n --argjson fa "$(date +%s)" \
+  '{five_hour:{used_percentage:77,resets_at:"not-a-number"},seven_day:{},fetched_at:$fa}' > "$GUL_CACHE"
+nonnum_out=$(printf '%s' "$NO_RATE_LIMITS_JSON" | CLAUDE_CONFIG_DIR="$HOME/.claude" bash "$STATUSLINE" 2>&1)
+nonnum_status=$?
+assert_eq "test_non_numeric_resets_at_treated_as_no_expiry: statusline exits 0 (no arithmetic error)" "0" "$nonnum_status"
+echo "$nonnum_out" | grep -q '77%'
+check "test_non_numeric_resets_at_treated_as_no_expiry: renders despite malformed resets_at" $?
+rm -f "$GUL_CACHE"
+
+# test_resets_at_equals_now_boundary_still_renders — the rollover check
+# uses `now <= resets_at`, so a window resetting in exactly this second
+# must still render (only strictly-past should drop). get_usage_limits
+# is exercised in-process (not via a subprocess) so there's no spawn
+# delay between capturing "now" and the function's own `date +%s` call;
+# retried if a wall-clock second boundary is crossed mid-check, so the
+# assertion itself never races.
+GUL_FUNC_SRC=$(extract_func "$STATUSLINE" get_usage_limits)
+RENDER_SEG_SRC=$(extract_func "$STATUSLINE" render_usage_segment)
+WRITE_CACHE_SRC=$(extract_func "$STATUSLINE" write_usage_cache)
+eval "$RENDER_SEG_SRC"
+eval "$WRITE_CACHE_SRC"
+eval "$GUL_FUNC_SRC"
+ACCOUNT_ID=work
+ACCOUNT_ASSUMED=0
+USAGE_CACHE="${RUNTIME_DIR}/.claude_usage_limits_work.json"
+INPUT='{"workspace":{"current_dir":"/tmp"}}'
+boundary_before="" boundary_after="" boundary_out=""
+for _ in 1 2 3 4 5; do
+  boundary_before=$(date +%s)
+  jq -n --argjson f "$boundary_before" --argjson fa "$boundary_before" \
+    '{five_hour:{used_percentage:55,resets_at:$f},seven_day:{},fetched_at:$fa}' > "$USAGE_CACHE"
+  boundary_out=$(get_usage_limits)
+  boundary_after=$(date +%s)
+  [[ "$boundary_before" == "$boundary_after" ]] && break
+done
+echo "$boundary_out" | grep -q '55%'
+check "test_resets_at_equals_now_boundary_still_renders: resets_at==now still renders" $?
+rm -f "$USAGE_CACHE"
 
 rm -f "$GUL_CACHE"
 
@@ -556,7 +625,21 @@ check "symlinked RUNTIME_DIR: refused loudly" $?
 [[ -L "$RUNTIME_DIR" ]]; check "symlinked RUNTIME_DIR: left untouched (still a symlink, not replaced)" $?
 [[ -z "$(ls -A "$SYMLINK_TARGET" 2>/dev/null)" ]]; check "symlinked RUNTIME_DIR: no lock/artifact/cache written into the symlink target" $?
 rm -f /tmp/.cll_symlink_stderr
-rm -rf "$SYMLINK_TARGET"
+
+# test_runtime_dir_unsafe_still_renders — the existing symlink test above
+# discards stdout entirely; capture it here so an unsafe RUNTIME_DIR is
+# proven to degrade gracefully (progress bar + folder still render, no
+# usage segment) rather than silently producing a blank/broken line.
+UNSAFE_RENDER_DIR=$(mktemp -d)
+unsafe_render_json=$(jq -n --arg dir "$UNSAFE_RENDER_DIR" '{workspace:{current_dir:$dir},context_window:{used_percentage:42}}')
+unsafe_render_out=$(printf '%s' "$unsafe_render_json" | CLAUDE_CONFIG_DIR="$HOME/.claude" bash "$STATUSLINE" 2>/dev/null)
+echo "$unsafe_render_out" | grep -q '42%'
+check "test_runtime_dir_unsafe_still_renders: progress bar/context percent still renders" $?
+echo "$unsafe_render_out" | grep -qF "$(basename "$UNSAFE_RENDER_DIR")"
+check "test_runtime_dir_unsafe_still_renders: folder name still renders" $?
+echo "$unsafe_render_out" | grep -Eq '(5h|7d):[0-9]+%'
+[[ $? -ne 0 ]]; check "test_runtime_dir_unsafe_still_renders: no usage segment (cache disabled)" $?
+rm -rf "$UNSAFE_RENDER_DIR" "$SYMLINK_TARGET"
 rm -f "$RUNTIME_DIR"
 
 mkdir -p "$RUNTIME_DIR"
